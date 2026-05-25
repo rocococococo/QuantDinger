@@ -11,6 +11,7 @@ from app.routes.backtest import (
     _request_commission,
     _request_slippage,
 )
+from app.routes import backtest as backtest_routes
 from app.services.backtest import BacktestService
 from app.utils import auth
 
@@ -25,6 +26,60 @@ def test_autoresearch_capabilities_endpoint_reports_native_cost_stress(client):
     assert data['native_engine'] is True
     assert data['supports_sampled_window_cost_stress'] is True
     assert 'sampled_window_cost_stress' in data['capabilities']
+
+
+def test_autoresearch_indicator_backtest_endpoint_runs_without_ui_login(client, monkeypatch):
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return {
+            'totalProfit': 12.5,
+            'totalReturn': 0.125,
+            'maxDrawdown': 0.0,
+            'totalTrades': 1,
+            'equityCurve': [{'time': '2026-05-01 13:31', 'value': 10012.5}],
+            'trades': [{'time': '2026-05-01 13:31', 'type': 'close_long', 'profit': 12.5}],
+            'executionAssumptions': {
+                'actualDataRange': {
+                    'start': '2026-05-01T13:30:00+00:00',
+                    'end': '2026-05-01T13:31:00+00:00',
+                }
+            },
+        }
+
+    monkeypatch.setattr(backtest_routes.backtest_service, 'run', fake_run)
+
+    resp = client.post(
+        '/api/autoresearch/indicator-backtest',
+        json={
+            'indicatorCode': "df['buy'] = False\ndf['sell'] = False\n",
+            'symbol': 'SOXL',
+            'market': 'USStock',
+            'timeframe': '1m',
+            'startDate': '2026-05-01',
+            'endDate': '2026-05-01',
+            'persist': False,
+            'autoresearchTrace': {
+                'run_id': 'ar-run-001',
+                'candidate_id': 'candidate-001',
+                'strategy_ir_sha256': 'sha256:ir',
+                'qd_code_sha256': 'sha256:code',
+            },
+            'qd_native_validation_scope': 'sampled_window',
+            'autoresearchValidationWindow': {
+                'start_datetime': '2026-05-01T13:30:00+00:00',
+                'end_datetime': '2026-05-01T13:31:00+00:00',
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload['code'] == 1
+    assert payload['data']['persistenceStatus'] == 'ephemeral'
+    assert payload['data']['nativeRunId'].startswith('autoresearch-ephemeral-')
+    assert captured['symbol'] == 'SOXL'
 
 
 def test_autoresearch_cost_stress_scope_uses_stressed_execution_config():
