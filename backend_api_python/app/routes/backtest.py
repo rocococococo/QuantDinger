@@ -337,7 +337,7 @@ def _autoresearch_validation_window_metrics(data: dict, *, result: dict, initial
         'trades': trades,
         'validationWindow': dict(validation_window),
         'equityBasis': 'validation_window_relative_pnl',
-        'equityFloor': -float(initial_capital or 0.0),
+        'equityFloor': 0.0,
     }
 
 

@@ -105,7 +105,7 @@ def test_autoresearch_validation_window_metrics_exclude_execution_warmup():
     assert metrics['totalTrades'] == 1
     assert metrics['maxDrawdown'] == 0.0
     assert metrics['equityBasis'] == 'validation_window_relative_pnl'
-    assert metrics['equityFloor'] == -10000.0
+    assert metrics['equityFloor'] == 0.0
     assert metrics['validationWindow'] == data['autoresearchValidationWindow']
     assert metrics['equityCurve'] == [
         {'time': '2026-02-01 14:30', 'value': 0.0},
@@ -131,7 +131,7 @@ def test_autoresearch_cost_stress_uses_validation_relative_equity_floor():
             'totalTrades': 1,
             'totalCommission': 0.04,
             'equityBasis': 'validation_window_relative_pnl',
-            'equityFloor': -10000.0,
+            'equityFloor': 0.0,
             'equityCurve': [
                 {'time': '2026-02-01 14:30', 'value': 0.0},
                 {'time': '2026-02-02 20:00', 'value': 3.0},
@@ -145,8 +145,42 @@ def test_autoresearch_cost_stress_uses_validation_relative_equity_floor():
     assert payload['passed'] is True
     assert payload['observed']['total_profit'] == 3.0
     assert payload['observed']['equity_basis'] == 'validation_window_relative_pnl'
-    assert payload['observed']['equity_floor'] == -10000.0
+    assert payload['observed']['equity_floor'] == 0.0
     assert payload['blocking_reasons'] == []
+
+
+def test_autoresearch_cost_stress_blocks_relative_equity_floor_breach():
+    data = {
+        'qd_native_validation_scope': 'sampled_window_cost_stress',
+        'sampleWindowPlanHash': 'sha256:sample-plan',
+        'scenarioGridHash': 'sha256:scenario-grid',
+        'costStressScenarioId': 'next_bar_open_2x_cost',
+    }
+
+    payload = _autoresearch_cost_stress_payload(
+        data,
+        result={
+            'totalProfit': 2.0,
+            'totalReturn': 0.02,
+            'maxDrawdown': -0.05,
+            'totalTrades': 1,
+            'totalCommission': 0.04,
+            'equityBasis': 'validation_window_relative_pnl',
+            'equityFloor': 0.0,
+            'equityCurve': [
+                {'time': '2026-02-01 14:30', 'value': 0.0},
+                {'time': '2026-02-01 15:30', 'value': -1.0},
+                {'time': '2026-02-02 20:00', 'value': 2.0},
+            ],
+        },
+        commission=0.02,
+        slippage=0.0004,
+        execution={},
+    )
+
+    assert payload['passed'] is False
+    assert payload['observed']['min_equity'] == -1.0
+    assert 'qd_native_cost_stress_equity_floor_breached' in payload['blocking_reasons']
 
 
 def test_autoresearch_native_run_id_falls_back_when_persistence_is_unavailable():
