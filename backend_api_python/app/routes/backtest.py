@@ -2,12 +2,13 @@
 Backtest API routes
 """
 from flask import Blueprint, request, jsonify, g
-from datetime import datetime
+from datetime import datetime, timezone
 import calendar
 import traceback
 import json
 import time
 import os
+import hashlib
 
 from app.services.backtest import BacktestService
 from app.data_sources.factory import DataSourceFactory
@@ -42,6 +43,361 @@ def _backtest_range_limit(timeframe: str, start_date: datetime) -> tuple[datetim
     if tf in ['15m', '30m']:
         return _add_months(start_date, 12), '1 year'
     return _add_months(start_date, 36), '3 years'
+
+
+def _parse_backtest_datetime(value: str) -> datetime:
+    text = str(value or '').strip()
+    if not text:
+        raise ValueError('empty datetime')
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        parsed = datetime.strptime(text, '%Y-%m-%d')
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _first_mapping(*values):
+    for value in values:
+        if isinstance(value, dict) and value:
+            return value
+    return {}
+
+
+def _first_present(*values):
+    for value in values:
+        if value is not None and value != '':
+            return value
+    return None
+
+
+def _float_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _autoresearch_execution_config(data: dict, strategy_config: dict) -> dict:
+    scenario = _first_mapping(data.get('costStressScenario'), data.get('cost_stress_scenario'))
+    scenario_execution = _first_mapping(scenario.get('execution'))
+    execution = _first_mapping(data.get('execution'))
+    strategy_execution = _first_mapping(strategy_config.get('execution'))
+    merged = {**strategy_execution, **execution, **scenario_execution}
+    return dict(merged) if merged else {}
+
+
+def _request_commission(data: dict, execution: dict, default: float = 0.001) -> float:
+    direct = _float_or_none(data.get('commission'))
+    if direct is not None:
+        return direct
+    value = _float_or_none(
+        _first_present(
+            execution.get('commission_value'),
+            execution.get('commissionValue'),
+            execution.get('commission'),
+        )
+    )
+    return default if value is None else value
+
+
+def _request_slippage(data: dict, execution: dict, default: float = 0.0) -> float:
+    direct = _float_or_none(data.get('slippage'))
+    if direct is not None:
+        return direct
+    bps = _float_or_none(_first_present(execution.get('slippage_bps'), execution.get('slippageBps')))
+    if bps is not None:
+        return bps / 10000.0
+    value = _float_or_none(execution.get('slippage'))
+    return default if value is None else value
+
+
+def _autoresearch_scope(data: dict) -> str:
+    trace = data.get('autoresearchTrace') if isinstance(data.get('autoresearchTrace'), dict) else {}
+    return str(
+        data.get('qd_native_validation_scope')
+        or data.get('qdNativeValidationScope')
+        or trace.get('qd_native_validation_scope')
+        or ''
+    ).strip()
+
+
+def _autoresearch_ohlcv_rows(data: dict) -> list[dict]:
+    trace = data.get('autoresearchTrace') if isinstance(data.get('autoresearchTrace'), dict) else {}
+    if not trace:
+        return []
+    if _autoresearch_scope(data) not in ('sampled_window', 'sampled_window_cost_stress'):
+        return []
+    rows = (
+        data.get('autoresearchOhlcvRows')
+        if isinstance(data.get('autoresearchOhlcvRows'), list)
+        else data.get('autoresearch_ohlcv_rows')
+        if isinstance(data.get('autoresearch_ohlcv_rows'), list)
+        else data.get('marketDataRows')
+        if isinstance(data.get('marketDataRows'), list)
+        else []
+    )
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _autoresearch_native_run_id(data: dict, result: dict, run_id) -> str:
+    if run_id is not None:
+        return str(run_id)
+    trace = data.get('autoresearchTrace') if isinstance(data.get('autoresearchTrace'), dict) else {}
+    if not trace:
+        return ''
+    seed = {
+        'run_id': trace.get('run_id'),
+        'candidate_id': trace.get('candidate_id'),
+        'source_surface': trace.get('source_surface'),
+        'strategy_ir_sha256': trace.get('strategy_ir_sha256'),
+        'qd_code_sha256': trace.get('qd_code_sha256'),
+        'benchmark_set_hash': trace.get('benchmark_set_hash'),
+        'validation_scope': _autoresearch_scope(data),
+        'sample_window_plan_hash': data.get('sampleWindowPlanHash') or data.get('sample_window_plan_hash'),
+        'scenario_grid_hash': data.get('scenarioGridHash') or data.get('scenario_grid_hash'),
+        'cost_stress_scenario_id': data.get('costStressScenarioId') or data.get('cost_stress_scenario_id'),
+        'actual_range': (result.get('executionAssumptions') or {}).get('actualDataRange')
+        if isinstance(result.get('executionAssumptions'), dict)
+        else {},
+    }
+    digest = hashlib.sha256(
+        json.dumps(seed, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()
+    return f'autoresearch-ephemeral-{digest[:16]}'
+
+
+def _autoresearch_cost_stress_payload(
+    data: dict,
+    *,
+    result: dict,
+    commission: float,
+    slippage: float,
+    execution: dict,
+) -> dict:
+    if _autoresearch_scope(data) != 'sampled_window_cost_stress':
+        return {}
+    scenario = _first_mapping(data.get('costStressScenario'), data.get('cost_stress_scenario'))
+    scenario_id = str(
+        data.get('costStressScenarioId')
+        or data.get('cost_stress_scenario_id')
+        or scenario.get('scenario_id')
+        or scenario.get('scenarioId')
+        or ''
+    ).strip()
+    sample_window_plan_hash = str(data.get('sampleWindowPlanHash') or data.get('sample_window_plan_hash') or '').strip()
+    scenario_grid_hash = str(data.get('scenarioGridHash') or data.get('scenario_grid_hash') or '').strip()
+    stress_multiple = _float_or_none(_first_present(scenario.get('stress_multiple'), scenario.get('stressMultiple')))
+    fill_model = str(_first_present(scenario.get('fill_model'), scenario.get('fillModel'), execution.get('fill_model')) or '').strip()
+    observed = _autoresearch_cost_stress_observed(result)
+    reasons = []
+    if observed.get('total_trades', 0) <= 0:
+        reasons.append('qd_native_cost_stress_trades_missing')
+    if observed.get('total_profit', 0.0) <= 0.0:
+        reasons.append('qd_native_cost_stress_total_return_not_positive')
+    min_equity = observed.get('min_equity')
+    equity_floor = observed.get('equity_floor')
+    if min_equity is not None and equity_floor is not None and min_equity < equity_floor:
+        reasons.append('qd_native_cost_stress_equity_floor_breached')
+    if min_equity is not None and equity_floor is None and min_equity <= 0.0:
+        reasons.append('qd_native_cost_stress_equity_floor_breached')
+    return {
+        'contract_version': 'autoresearch_qd_native_cost_stress_sample.v1',
+        'authority': 'qd-native',
+        'scope': 'sampled_window_cost_stress',
+        'status': 'observed',
+        'passed': not reasons,
+        'basis': 'qd_native_same_window_cost_replay',
+        'source': 'qd_native_same_window_cost_replay',
+        'spread_model': 'explicit_or_estimated_spread.v1',
+        'sample_window_plan_hash': sample_window_plan_hash,
+        'scenario_grid_hash': scenario_grid_hash,
+        'scenario_id': scenario_id,
+        'stress_multiple': stress_multiple,
+        'fill_model': fill_model,
+        'execution': dict(execution),
+        'cost_model': {
+            'commission': commission,
+            'slippage': slippage,
+            'commission_model': execution.get('commission_model') or execution.get('commissionModel') or '',
+            'slippage_model': execution.get('slippage_model') or execution.get('slippageModel') or '',
+            'slippage_bps': execution.get('slippage_bps') or execution.get('slippageBps'),
+        },
+        'observed': observed,
+        'blocking_reasons': reasons,
+    }
+
+
+def _autoresearch_cost_stress_observed(result: dict) -> dict:
+    equity_curve = result.get('equityCurve') if isinstance(result.get('equityCurve'), list) else []
+    equity_values = []
+    for point in equity_curve:
+        if not isinstance(point, dict):
+            continue
+        value = _float_or_none(point.get('value') if point.get('value') is not None else point.get('equity'))
+        if value is not None:
+            equity_values.append(value)
+    return {
+        'total_profit': _float_or_none(result.get('totalProfit')) or 0.0,
+        'total_return': _float_or_none(result.get('totalReturn')) or 0.0,
+        'max_drawdown': _float_or_none(result.get('maxDrawdown')) or 0.0,
+        'total_trades': int(_float_or_none(result.get('totalTrades')) or 0),
+        'total_commission': _float_or_none(result.get('totalCommission')) or 0.0,
+        'equity_basis': str(result.get('equityBasis') or '').strip(),
+        'equity_floor': _float_or_none(result.get('equityFloor')),
+        'min_equity': min(equity_values) if equity_values else None,
+        'max_equity': max(equity_values) if equity_values else None,
+        'equity_point_count': len(equity_values),
+    }
+
+
+def _autoresearch_validation_window(data: dict) -> dict:
+    trace = data.get('autoresearchTrace') if isinstance(data.get('autoresearchTrace'), dict) else {}
+    return _first_mapping(
+        data.get('autoresearchValidationWindow'),
+        data.get('autoresearch_validation_window'),
+        data.get('validationWindow'),
+        data.get('validation_window'),
+        trace.get('validation_window'),
+    )
+
+
+def _window_datetime_bounds(window: dict) -> tuple[datetime | None, datetime | None]:
+    start = _first_present(
+        window.get('start_datetime'),
+        window.get('startDateTime'),
+        window.get('startDatetime'),
+        window.get('start'),
+    )
+    end = _first_present(
+        window.get('end_datetime'),
+        window.get('endDateTime'),
+        window.get('endDatetime'),
+        window.get('end'),
+    )
+    if not start or not end:
+        return None, None
+    try:
+        return _parse_backtest_datetime(start), _parse_backtest_datetime(end)
+    except ValueError:
+        return None, None
+
+
+def _result_timestamp(value) -> datetime | None:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    try:
+        return _parse_backtest_datetime(text)
+    except ValueError:
+        return None
+
+
+def _autoresearch_validation_window_metrics(data: dict, *, result: dict, initial_capital: float) -> dict:
+    if _autoresearch_scope(data) not in ('sampled_window', 'sampled_window_cost_stress'):
+        return {}
+    validation_window = _autoresearch_validation_window(data)
+    if not validation_window:
+        return {}
+    start_dt, end_dt = _window_datetime_bounds(validation_window)
+    if start_dt is None or end_dt is None or end_dt < start_dt:
+        return {}
+    equity_curve = result.get('equityCurve') if isinstance(result.get('equityCurve'), list) else []
+    points = []
+    for point in equity_curve:
+        if not isinstance(point, dict):
+            continue
+        timestamp_text = str(point.get('time') or point.get('timestamp') or '').strip()
+        timestamp = _result_timestamp(timestamp_text)
+        value = _float_or_none(point.get('value') if point.get('value') is not None else point.get('equity'))
+        if timestamp is not None and value is not None:
+            points.append((timestamp, timestamp_text, value))
+    points.sort(key=lambda item: item[0])
+    in_window = [(timestamp_text, value) for timestamp, timestamp_text, value in points if start_dt <= timestamp <= end_dt]
+    if not in_window:
+        return {}
+    baseline_candidates = [value for timestamp, _timestamp_text, value in points if timestamp <= start_dt]
+    baseline = baseline_candidates[-1] if baseline_candidates else in_window[0][1]
+    relative_equity = [{'time': timestamp_text, 'value': round(value - baseline, 10)} for timestamp_text, value in in_window]
+    relative_values = [point['value'] for point in relative_equity]
+    max_drawdown_amount = _max_drawdown_amount(relative_values)
+    max_drawdown_pct = round((max_drawdown_amount / initial_capital) * 100.0, 10) if initial_capital > 0 else max_drawdown_amount
+    trades = _autoresearch_window_trades(result.get('trades') if isinstance(result.get('trades'), list) else [], start_dt, end_dt)
+    total_profit = relative_values[-1] if relative_values else 0.0
+    return {
+        'totalProfit': round(total_profit, 10),
+        'totalReturn': round((total_profit / initial_capital) * 100.0, 10) if initial_capital > 0 else 0.0,
+        'maxDrawdown': max_drawdown_pct,
+        'totalTrades': len([trade for trade in trades if _float_or_none(trade.get('profit')) not in (None, 0.0)]),
+        'totalCommission': round(sum(_float_or_none(trade.get('commission')) or 0.0 for trade in trades), 10),
+        'equityCurve': relative_equity,
+        'trades': trades,
+        'validationWindow': dict(validation_window),
+        'equityBasis': 'validation_window_relative_pnl',
+        'equityFloor': -float(initial_capital or 0.0),
+    }
+
+
+def _autoresearch_window_trades(trades: list, start_dt: datetime, end_dt: datetime) -> list[dict]:
+    window_trades = []
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        timestamp = _result_timestamp(
+            _first_present(
+                trade.get('exit_timestamp'),
+                trade.get('exitTimestamp'),
+                trade.get('exit_time'),
+                trade.get('exitTime'),
+                trade.get('time'),
+                trade.get('timestamp'),
+            )
+        )
+        if timestamp is not None and start_dt <= timestamp <= end_dt:
+            window_trades.append(dict(trade))
+    return window_trades
+
+
+def _max_drawdown_amount(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    peak = values[0]
+    max_drawdown = 0.0
+    for value in values:
+        if value > peak:
+            peak = value
+        drawdown = value - peak
+        if drawdown < max_drawdown:
+            max_drawdown = drawdown
+    return round(max_drawdown, 10)
+
+
+def _attach_autoresearch_scoring_provenance(data: dict, result: dict, validation_metrics: dict) -> None:
+    if not validation_metrics:
+        return
+    assumptions = result.get('executionAssumptions') if isinstance(result.get('executionAssumptions'), dict) else {}
+    provenance = (
+        assumptions.get('marketDataProvenance')
+        if isinstance(assumptions.get('marketDataProvenance'), dict)
+        else {}
+    )
+    provenance = dict(provenance)
+    provenance['scoringValidationWindow'] = dict(validation_metrics.get('validationWindow') or {})
+    execution_window = _first_mapping(
+        data.get('executionWindow'),
+        data.get('execution_window'),
+        (data.get('autoresearchTrace') or {}).get('execution_window')
+        if isinstance(data.get('autoresearchTrace'), dict)
+        else {},
+    )
+    if execution_window:
+        provenance['executionWindow'] = dict(execution_window)
+    assumptions = dict(assumptions)
+    assumptions['marketDataProvenance'] = provenance
+    result['executionAssumptions'] = assumptions
 
 
 def _openrouter_base_and_key() -> tuple[str, str]:
@@ -191,12 +547,15 @@ def run_backtest():
         timeframe = data.get('timeframe', '1D')
         start_date_str = data.get('startDate', '')
         end_date_str = data.get('endDate', '')
+        start_datetime_str = data.get('startDateTime') or data.get('startDatetime') or ''
+        end_datetime_str = data.get('endDateTime') or data.get('endDatetime') or ''
         initial_capital = float(data.get('initialCapital', 10000))
-        commission = float(data.get('commission', 0.001))
-        slippage = float(data.get('slippage', 0.0))
         leverage = int(data.get('leverage', 1))
         trade_direction = data.get('tradeDirection', 'long')  # long, short, both
         strategy_config = data.get('strategyConfig') or {}
+        execution_config = _autoresearch_execution_config(data, strategy_config)
+        commission = _request_commission(data, execution_config, default=0.001)
+        slippage = _request_slippage(data, execution_config, default=0.0)
         # 多时间框架回测开关（默认开启，仅加密货币市场有效）
         enable_mtf = data.get('enableMtf', True)
         if isinstance(enable_mtf, str):
@@ -205,6 +564,7 @@ def run_backtest():
         persist = data.get('persist', True)
         if isinstance(persist, str):
             persist = persist.lower() in ['true', '1', 'yes']
+        supplied_ohlcv_rows = _autoresearch_ohlcv_rows(data)
         
         # (Debug) log received params if needed
         
@@ -232,9 +592,13 @@ def run_backtest():
         
         # 转换日期
         # 开始日期：当天的 00:00:00
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+        start_date = _parse_backtest_datetime(start_datetime_str) if start_datetime_str else datetime.strptime(start_date_str, '%Y-%m-%d')
         # 结束日期：当天的 23:59:59，确保包含整天的数据
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+        end_date = (
+            _parse_backtest_datetime(end_datetime_str)
+            if end_datetime_str
+            else datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+        )
         
         # 验证时间范围限制
         days_diff = (end_date - start_date).days
@@ -259,7 +623,7 @@ def run_backtest():
 
         # 执行回测（支持多时间框架高精度回测）
         # 加密货币市场且启用MTF时，使用多时间框架回测
-        if enable_mtf and market.lower() in ['crypto', 'cryptocurrency']:
+        if enable_mtf and market.lower() in ['crypto', 'cryptocurrency'] and not supplied_ohlcv_rows:
             result = backtest_service.run_multi_timeframe(
                 indicator_code=indicator_code,
                 market=market,
@@ -288,7 +652,8 @@ def run_backtest():
                 slippage=slippage,
                 leverage=leverage,
                 trade_direction=trade_direction,
-                strategy_config=strategy_config
+                strategy_config=strategy_config,
+                ohlcv_rows=supplied_ohlcv_rows or None,
             )
             # 添加标准回测的精度信息
             result['precision_info'] = {
@@ -297,6 +662,25 @@ def run_backtest():
                 'precision': 'standard',
                 'message': '使用标准K线回测'
             }
+
+        validation_metrics = _autoresearch_validation_window_metrics(
+            data,
+            result=result,
+            initial_capital=initial_capital,
+        )
+        if validation_metrics:
+            result['autoresearchValidationMetrics'] = validation_metrics
+            _attach_autoresearch_scoring_provenance(data, result, validation_metrics)
+
+        cost_stress = _autoresearch_cost_stress_payload(
+            data,
+            result=validation_metrics or result,
+            commission=commission,
+            slippage=slippage,
+            execution=execution_config,
+        )
+        if cost_stress:
+            result['cost_stress'] = cost_stress
 
         run_id = None
         if persist:
@@ -321,14 +705,23 @@ def run_backtest():
                 result=result,
                 code=indicator_code,
             )
-        
+
+        native_run_id = _autoresearch_native_run_id(data, result, run_id)
+        response_data = {
+            'runId': run_id,
+            'nativeRunId': native_run_id,
+            'persistenceStatus': 'persisted' if run_id is not None else 'ephemeral' if native_run_id else 'not_persisted',
+            'result': result
+        }
+        if validation_metrics:
+            response_data['autoresearchValidationMetrics'] = validation_metrics
+        if cost_stress:
+            response_data['cost_stress'] = cost_stress
+
         return jsonify({
             'code': 1,
             'msg': 'Backtest succeeded',
-            'data': {
-                'runId': run_id,
-                'result': result
-            }
+            'data': response_data
         })
         
     except ValueError as e:
@@ -825,4 +1218,3 @@ def ai_analyze_backtest_runs():
         logger.error(f"ai_analyze_backtest_runs failed: {e}")
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
-

@@ -230,6 +230,49 @@ class BacktestService:
             equity = 0.0
         return round(-equity, 2)
 
+    def _position_sizing(self, strategy_config: Optional[Dict[str, Any]]) -> tuple[float, Optional[float]]:
+        cfg = strategy_config or {}
+        pos_cfg = cfg.get('position') or {}
+        raw_mode = pos_cfg.get('sizingMode') or pos_cfg.get('mode') or ''
+        sizing_mode = str(raw_mode).strip().lower()
+        raw_fixed_shares = (
+            pos_cfg.get('fixedShares')
+            if pos_cfg.get('fixedShares') is not None
+            else pos_cfg.get('shares')
+            if pos_cfg.get('shares') is not None
+            else pos_cfg.get('sizingValue')
+        )
+        fixed_shares = None
+        if sizing_mode in ('shares', 'fixed_shares', 'fixed-share', 'fixed') and raw_fixed_shares is not None:
+            try:
+                fixed_shares = max(0.0, float(raw_fixed_shares))
+            except (TypeError, ValueError):
+                fixed_shares = None
+
+        raw_entry_pct = pos_cfg.get('entryPct')
+        if raw_entry_pct is None or raw_entry_pct == 0:
+            entry_pct = 1.0
+        else:
+            entry_pct = float(raw_entry_pct)
+            if entry_pct > 1:
+                entry_pct = entry_pct / 100.0
+        return max(0.0, min(entry_pct, 1.0)), fixed_shares
+
+    def _entry_shares(
+        self,
+        *,
+        capital: float,
+        price: float,
+        leverage: int,
+        entry_pct: float,
+        fixed_shares: Optional[float],
+    ) -> float:
+        if fixed_shares is not None and fixed_shares > 0:
+            return fixed_shares
+        if price <= 0:
+            return 0.0
+        return (capital * entry_pct * leverage) / price
+
     def persist_run(
         self,
         *,
@@ -724,17 +767,9 @@ class BacktestService:
             if trailing_activation_pct_eff <= 0 and take_profit_pct_eff > 0:
                 trailing_activation_pct_eff = take_profit_pct_eff
         
-        # Entry percentage
-        pos_cfg = cfg.get('position') or {}
-        raw_entry_pct = pos_cfg.get('entryPct')
-        # If entryPct is None, 0, or not provided, default to 1.0 (100%)
-        if raw_entry_pct is None or raw_entry_pct == 0:
-            entry_pct_cfg = 1.0
-        else:
-            entry_pct_cfg = float(raw_entry_pct)
-            if entry_pct_cfg > 1:
-                entry_pct_cfg = entry_pct_cfg / 100.0
-        entry_pct_cfg = max(0.01, min(entry_pct_cfg, 1.0))  # Minimum 1% to avoid 0 position
+        entry_pct_cfg, fixed_shares_cfg = self._position_sizing(strategy_config)
+        if fixed_shares_cfg is None:
+            entry_pct_cfg = max(0.01, entry_pct_cfg)
         
         logger.info(f"Trading params: capital={capital}, leverage={lev}, entry_pct={entry_pct_cfg}, strategy_config={cfg}")
         
@@ -1268,10 +1303,14 @@ class BacktestService:
                                 continue
                         
                         # Now open long
-                        use_capital = capital * entry_pct_cfg
-                        if exec_price > 0:
-                            shares = (use_capital * lev) / exec_price
-                        else:
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=lev,
+                            entry_pct=entry_pct_cfg,
+                            fixed_shares=fixed_shares_cfg,
+                        )
+                        if shares <= 0:
                             logger.warning(f"Invalid exec_price={exec_price} at {timestamp}, skipping open_long")
                             pending_signal = None
                             continue
@@ -1359,10 +1398,14 @@ class BacktestService:
                                 continue
                         
                         # Now open short
-                        use_capital = capital * entry_pct_cfg
-                        if exec_price > 0:
-                            shares = (use_capital * lev) / exec_price
-                        else:
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=lev,
+                            entry_pct=entry_pct_cfg,
+                            fixed_shares=fixed_shares_cfg,
+                        )
+                        if shares <= 0:
                             logger.warning(f"Invalid exec_price={exec_price} at {timestamp}, skipping open_short")
                             pending_signal = None
                             continue
@@ -1654,6 +1697,7 @@ class BacktestService:
         indicator_params: Optional[Dict[str, Any]] = None,
         user_id: int = 1,
         indicator_id: Optional[int] = None,
+        ohlcv_rows: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Run backtest.
@@ -1674,7 +1718,18 @@ class BacktestService:
         """
         
         # 1. Fetch candle data
-        df = self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
+        df = (
+            self._dataframe_from_supplied_ohlcv_rows(
+                ohlcv_rows,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if ohlcv_rows
+            else self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
+        )
         if df.empty:
             raise ValueError("No candle data available in the backtest date range")
         
@@ -1714,12 +1769,98 @@ class BacktestService:
         """因上游 K 线不足而缩短区间时，写入 executionAssumptions（供前端展示，非错误）。"""
         attrs = getattr(df, "attrs", None) or {}
         ar = attrs.get("backtestActualRange")
-        if not ar:
+        provenance = attrs.get("backtestMarketDataProvenance")
+        if not ar and not provenance:
             return
         ea = dict(result.get("executionAssumptions") or {})
-        ea["actualDataRange"] = ar
+        if ar:
+            ea["actualDataRange"] = ar
+        if provenance:
+            ea["marketDataProvenance"] = provenance
+            ea["marketDataSource"] = provenance.get("source")
+            ea["dataSourceMode"] = provenance.get("data_source_mode")
         ea["requestedRangeAdjusted"] = True
         result["executionAssumptions"] = ea
+
+    def _dataframe_from_supplied_ohlcv_rows(
+        self,
+        rows: Optional[List[Dict[str, Any]]],
+        *,
+        market: str,
+        symbol: str,
+        timeframe: str,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
+        if not rows:
+            return pd.DataFrame()
+        frame = pd.DataFrame([row for row in rows if isinstance(row, dict)]).copy()
+        if frame.empty:
+            return pd.DataFrame()
+        time_column = next((column for column in ("time", "timestamp", "datetime", "date") if column in frame.columns), "")
+        required = {"open", "high", "low", "close"}
+        if not time_column or any(column not in frame.columns for column in required):
+            logger.warning("Supplied OHLCV rows missing required columns")
+            return pd.DataFrame()
+        if "volume" not in frame.columns:
+            frame["volume"] = 0.0
+        try:
+            timestamp = pd.to_datetime(frame[time_column], utc=True)
+        except Exception:
+            return pd.DataFrame()
+        frame["time"] = timestamp.dt.tz_convert("UTC").dt.tz_localize(None)
+        for column in ("open", "high", "low", "close", "volume"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=["time", "open", "high", "low", "close"]).copy()
+        if frame.empty:
+            return pd.DataFrame()
+        frame = frame.sort_values("time").drop_duplicates(subset=["time"], keep="last")
+        frame = frame.set_index("time")
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        filtered = frame[(frame.index >= start_ts) & (frame.index <= end_ts)].copy()
+        if filtered.empty:
+            return pd.DataFrame()
+        rows_hash = self._supplied_ohlcv_rows_hash(filtered)
+        filtered.attrs["backtestActualRange"] = {
+            "requestedStart": str(start_ts),
+            "requestedEnd": str(end_ts),
+            "actualStart": str(filtered.index.min()),
+            "actualEnd": str(filtered.index.max()),
+        }
+        filtered.attrs["backtestMarketDataProvenance"] = {
+            "source": "autoresearch_supplied_same_window_ohlcv",
+            "data_source_mode": "supplied_same_window_ohlcv",
+            "rows_hash": f"sha256:{rows_hash}",
+            "row_count": int(len(filtered)),
+            "market": str(market or ""),
+            "symbol": str(symbol or ""),
+            "timeframe": str(timeframe or ""),
+            "independent_from_autoresearch_payload": False,
+        }
+        logger.info(
+            "[Backtest] Using AutoResearch supplied OHLCV rows "
+            f"{market}:{symbol} {timeframe} rows={len(filtered)} hash=sha256:{rows_hash[:12]}"
+        )
+        return filtered
+
+    @staticmethod
+    def _supplied_ohlcv_rows_hash(frame: pd.DataFrame) -> str:
+        rows = []
+        for timestamp, row in frame[["open", "high", "low", "close", "volume"]].iterrows():
+            rows.append(
+                {
+                    "time": str(timestamp),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                }
+            )
+        return hashlib.sha256(
+            json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
     
     def _fetch_kline_data(
         self,
@@ -2487,12 +2628,7 @@ class BacktestService:
         trailing_pct_eff = trailing_pct / lev
         trailing_activation_pct_eff = trailing_activation_pct / lev
 
-        pos_cfg = cfg.get('position') or {}
-        entry_pct_cfg = float(pos_cfg.get('entryPct') or 1.0)  # expected 0~1
-        # Accept both 0~1 and 0~100 inputs (some clients may send percent units).
-        if entry_pct_cfg > 1:
-            entry_pct_cfg = entry_pct_cfg / 100.0
-        entry_pct_cfg = max(0.0, min(entry_pct_cfg, 1.0))
+        entry_pct_cfg, fixed_shares_cfg = self._position_sizing(strategy_config)
 
         scale_cfg = cfg.get('scale') or {}
         trend_add_cfg = scale_cfg.get('trendAdd') or {}
@@ -3283,17 +3419,30 @@ class BacktestService:
                         base_price = open_long_price_arr[i] if open_long_price_arr[i] > 0 else close
                     exec_price = base_price * (1 + slippage)
                     
-                    # Use specified pct (entryPct > position_size > full)
+                    # Use fixed shares when configured; otherwise use entryPct > position_size > full.
                     position_pct = None
                     if entry_pct_cfg and entry_pct_cfg > 0:
                         position_pct = entry_pct_cfg
                     elif has_position_management and position_size_arr[i] > 0:
                         position_pct = position_size_arr[i]
-                    if position_pct is not None and position_pct > 0 and position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
+                    if fixed_shares_cfg is not None and fixed_shares_cfg > 0:
+                        shares = fixed_shares_cfg
+                    elif position_pct is not None and position_pct > 0 and position_pct < 1:
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=leverage,
+                            entry_pct=position_pct,
+                            fixed_shares=None,
+                        )
                     else:
-                        shares = (capital * leverage) / exec_price
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=leverage,
+                            entry_pct=1.0,
+                            fixed_shares=None,
+                        )
                     
                     commission_fee = shares * exec_price * commission
                     
@@ -3408,17 +3557,30 @@ class BacktestService:
                         base_price = open_short_price_arr[i] if open_short_price_arr[i] > 0 else close
                     exec_price = base_price * (1 - slippage)
                     
-                    # Use specified pct (entryPct > position_size > full)
+                    # Use fixed shares when configured; otherwise use entryPct > position_size > full.
                     position_pct = None
                     if entry_pct_cfg and entry_pct_cfg > 0:
                         position_pct = entry_pct_cfg
                     elif has_position_management and position_size_arr[i] > 0:
                         position_pct = position_size_arr[i]
-                    if position_pct is not None and position_pct > 0 and position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
+                    if fixed_shares_cfg is not None and fixed_shares_cfg > 0:
+                        shares = fixed_shares_cfg
+                    elif position_pct is not None and position_pct > 0 and position_pct < 1:
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=leverage,
+                            entry_pct=position_pct,
+                            fixed_shares=None,
+                        )
                     else:
-                        shares = (capital * leverage) / exec_price
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=leverage,
+                            entry_pct=1.0,
+                            fixed_shares=None,
+                        )
                     
                     commission_fee = shares * exec_price * commission
                     
@@ -3711,12 +3873,7 @@ class BacktestService:
         lowest_since_entry = None
 
         # --- Position / scaling config (make old-format strategies support the same backtest modal features) ---
-        pos_cfg = cfg.get('position') or {}
-        entry_pct_cfg = float(pos_cfg.get('entryPct') if pos_cfg.get('entryPct') is not None else 1.0)  # expected 0~1
-        # Accept both 0~1 and 0~100 inputs (some clients may send percent units).
-        if entry_pct_cfg > 1:
-            entry_pct_cfg = entry_pct_cfg / 100.0
-        entry_pct_cfg = max(0.0, min(entry_pct_cfg, 1.0))
+        entry_pct_cfg, fixed_shares_cfg = self._position_sizing(strategy_config)
 
         scale_cfg = cfg.get('scale') or {}
         trend_add_cfg = scale_cfg.get('trendAdd') or {}
@@ -4205,15 +4362,14 @@ class BacktestService:
                     base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
                     exec_price = base_price * (1 + slippage)
                     # With leverage: position = capital * leverage / price
-                    # Use specified pct (entryPct preferred; else full)
-                    position_pct = None
-                    if entry_pct_cfg is not None and entry_pct_cfg > 0:
-                        position_pct = entry_pct_cfg
-                    if position_pct is not None and 0 < position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
+                    position_pct = entry_pct_cfg if entry_pct_cfg is not None and entry_pct_cfg > 0 else 1.0
+                    shares = self._entry_shares(
+                        capital=capital,
+                        price=exec_price,
+                        leverage=leverage,
+                        entry_pct=position_pct,
+                        fixed_shares=fixed_shares_cfg,
+                    )
                     # Margin (commission from capital)
                     margin = capital
                     commission_fee = shares * exec_price * commission
@@ -4287,14 +4443,14 @@ class BacktestService:
                     base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
                     exec_price = base_price * (1 - slippage)
                     # With leverage: position = capital * leverage / price
-                    position_pct = None
-                    if entry_pct_cfg is not None and entry_pct_cfg > 0:
-                        position_pct = entry_pct_cfg
-                    if position_pct is not None and 0 < position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
+                    position_pct = entry_pct_cfg if entry_pct_cfg is not None and entry_pct_cfg > 0 else 1.0
+                    shares = self._entry_shares(
+                        capital=capital,
+                        price=exec_price,
+                        leverage=leverage,
+                        entry_pct=position_pct,
+                        fixed_shares=fixed_shares_cfg,
+                    )
                     commission_fee = shares * exec_price * commission
                     
                     position = -shares  # Negative = short (owe shares)
@@ -4970,4 +5126,3 @@ class BacktestService:
             'equityCurve': cleaned_curve,
             'trades': cleaned_trades
         }
-

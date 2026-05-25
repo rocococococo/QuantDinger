@@ -60,6 +60,10 @@ def verify_token(token: str) -> dict:
     try:
         payload = jwt.decode(token, Config.SECRET_KEY, algorithms=['HS256'])
         
+        # Single-user deployments do not have DB-backed session revocation.
+        if _is_single_user_mode():
+            return payload
+
         # 验证 token_version（单一客户端登录控制）
         user_id = payload.get('user_id')
         token_version = payload.get('token_version')

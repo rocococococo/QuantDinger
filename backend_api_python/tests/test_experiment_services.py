@@ -7,6 +7,40 @@ import pandas as pd
 from app.services.experiment.evolution import StrategyEvolutionService
 from app.services.experiment.regime import MarketRegimeService
 from app.services.experiment.runner import ExperimentRunnerService
+from app.services.backtest import BacktestService
+
+
+def test_backtest_fixed_share_position_sizing_uses_configured_share_count() -> None:
+    index = pd.date_range("2026-01-01 09:30", periods=3, freq="min")
+    df = pd.DataFrame(
+        {
+            "open": [100.0, 110.0, 110.0],
+            "high": [100.0, 110.0, 110.0],
+            "low": [100.0, 110.0, 110.0],
+            "close": [100.0, 110.0, 110.0],
+        },
+        index=index,
+    )
+    signals = {
+        "buy": pd.Series([True, False, False], index=index),
+        "sell": pd.Series([False, True, False], index=index),
+    }
+
+    _, trades, _ = BacktestService()._simulate_trading(
+        df=df,
+        signals=signals,
+        initial_capital=10000.0,
+        commission=0.0,
+        slippage=0.0,
+        leverage=1,
+        trade_direction="long",
+        strategy_config={"position": {"sizingMode": "shares", "sizingValue": 10}},
+    )
+
+    assert trades[0]["type"] == "open_long"
+    assert trades[0]["amount"] == 10.0
+    assert trades[1]["type"] == "close_long"
+    assert trades[1]["amount"] == 10.0
 from app.services.experiment.scoring import StrategyScoringService
 
 
