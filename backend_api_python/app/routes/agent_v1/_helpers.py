@@ -5,6 +5,8 @@ from typing import Any, Optional
 
 from flask import jsonify, request
 
+from app.utils.agent_auth import mark_audit_body_skipped, request_body_too_large
+
 
 def envelope(data: Any, *, message: str = "ok", code: int = 0, status: int = 200) -> tuple:
     """Standard agent-facing response envelope.
@@ -34,7 +36,7 @@ def error(code: int, message: str, *, details: Any = None, retriable: bool = Fal
     }), http
 
 
-def get_json_or_400() -> tuple[Optional[dict], Optional[tuple]]:
+def get_json_or_400(*, max_bytes: int | None = None) -> tuple[Optional[dict], Optional[tuple]]:
     """Parse JSON body; on failure return (None, error_response).
 
     Use as:
@@ -42,7 +44,16 @@ def get_json_or_400() -> tuple[Optional[dict], Optional[tuple]]:
         if err:
             return err
     """
-    if not request.is_json and not (request.data or b"").strip():
+    if max_bytes is not None and request_body_too_large(max_bytes):
+        mark_audit_body_skipped()
+        return None, error(413, "JSON body too large", http=413)
+    if max_bytes is not None and request.content_length is None:
+        mark_audit_body_skipped()
+        return None, error(411, "Content-Length header is required", http=411)
+
+    raw_data = request.get_data(cache=True) if max_bytes is not None else (request.data or b"")
+
+    if not request.is_json and not (raw_data or b"").strip():
         return None, error(400, "JSON body required", http=400)
     body = request.get_json(silent=True)
     if body is None:

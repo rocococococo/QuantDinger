@@ -30,6 +30,8 @@ logger = get_logger(__name__)
 
 
 TOKEN_PREFIX = "qd_agent_"
+AGENT_GATEWAY_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_IDEMPOTENCY_KEY_CHARS = 120
 
 # Capability classes (see AI_INTEGRATION_DESIGN.md §3).
 SCOPE_R = "R"   # Read
@@ -295,7 +297,9 @@ def _audit(scope_class: str, status_code: int, response_summary: Any, duration_m
         req_summary: dict[str, Any] = {
             "args": _redact(dict(request.args)),
         }
-        if request.is_json:
+        if _skip_audit_body():
+            req_summary["json"] = "<skipped: request body too large>"
+        elif request.is_json:
             try:
                 req_summary["json"] = _redact(request.get_json(silent=True) or {})
             except Exception:
@@ -318,7 +322,7 @@ def _audit(scope_class: str, status_code: int, response_summary: Any, duration_m
                     request.method,
                     scope_class,
                     int(status_code),
-                    request.headers.get("Idempotency-Key"),
+                    _audit_idempotency_key(),
                     json.dumps(req_summary, default=str)[:8000],
                     json.dumps(_redact(response_summary), default=str)[:8000] if response_summary is not None else None,
                     int(duration_ms),
@@ -337,6 +341,37 @@ def _err(code: int, msg: str, details: Any = None, retriable: bool = False, stat
     return jsonify(body), status
 
 
+def request_body_too_large(max_bytes: int = AGENT_GATEWAY_MAX_REQUEST_BYTES) -> bool:
+    content_length = request.content_length
+    return content_length is not None and int(content_length) > int(max_bytes)
+
+
+def mark_audit_body_skipped() -> None:
+    g.agent_skip_audit_body = True
+
+
+def _skip_audit_body() -> bool:
+    return bool(getattr(g, "agent_skip_audit_body", False)) or request_body_too_large()
+
+
+def normalize_idempotency_key(raw: Any, *, required: bool = False) -> str:
+    key = str(raw or "").strip()
+    if not key:
+        if required:
+            raise ValueError("Idempotency-Key header is required")
+        return ""
+    if len(key) > MAX_IDEMPOTENCY_KEY_CHARS:
+        raise ValueError(f"Idempotency-Key exceeds {MAX_IDEMPOTENCY_KEY_CHARS} characters")
+    return key
+
+
+def _audit_idempotency_key() -> Optional[str]:
+    key = str(request.headers.get("Idempotency-Key") or "").strip()
+    if not key:
+        return None
+    return key[:MAX_IDEMPOTENCY_KEY_CHARS]
+
+
 def agent_required(scope: str = SCOPE_R):
     """Flask decorator: enforce token auth + scope + rate limit + audit.
 
@@ -351,6 +386,12 @@ def agent_required(scope: str = SCOPE_R):
         def wrapper(*args, **kwargs):
             _ensure_schema()
             t0 = time.time()
+            if request_body_too_large():
+                mark_audit_body_skipped()
+                resp, code = _err(413, "Agent request body too large", status=413)
+                _audit(scope, 413, {"reason": "request_body_too_large"}, int((time.time() - t0) * 1000))
+                return resp, code
+
             raw = _extract_bearer()
             if not raw or not raw.startswith(TOKEN_PREFIX):
                 resp, code = _err(401, "Missing or malformed agent token", status=401)
@@ -429,7 +470,11 @@ def with_idempotency(kind: str):
     Use only on writeful (W/B/T) endpoints.  Reads are naturally idempotent.
     """
     token_row = getattr(g, "agent_token", None) or {}
-    key = request.headers.get("Idempotency-Key")
+    try:
+        key = normalize_idempotency_key(request.headers.get("Idempotency-Key"))
+    except ValueError:
+        yield None
+        return
     if not key or not token_row.get("id"):
         yield None
         return

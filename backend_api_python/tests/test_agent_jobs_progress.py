@@ -101,3 +101,76 @@ def test_stream_picks_up_live_event():
     assert len(events) == 1
     assert events[0]["data"]["hello"] == "world"
     assert events[0]["terminal"] is True
+
+
+def test_submit_job_returns_existing_job_on_idempotency_insert_race(monkeypatch):
+    class UniqueViolation(Exception):
+        pgcode = "23505"
+
+    class FakeCursor:
+        def __init__(self, *, insert_raises: bool = False, row=None):
+            self.insert_raises = insert_raises
+            self.row = row
+
+        def execute(self, sql, params=None):
+            if "INSERT INTO qd_agent_jobs" in sql and self.insert_raises:
+                raise UniqueViolation('duplicate key value violates unique constraint "idx_agent_jobs_idem"')
+
+        def fetchone(self):
+            return self.row
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return self._cursor
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    connections = [
+        FakeConnection(FakeCursor(insert_raises=True)),
+        FakeConnection(
+            FakeCursor(
+                row={
+                    "job_id": "job-existing",
+                    "status": "queued",
+                    "kind": "autoresearch_backtest",
+                    "created_at": None,
+                }
+            )
+        ),
+    ]
+
+    monkeypatch.setattr(agent_jobs, "get_db_connection", lambda: connections.pop(0))
+    monkeypatch.setattr(
+        agent_jobs,
+        "_get_executor",
+        lambda: (_ for _ in ()).throw(AssertionError("executor called for duplicate idempotency key")),
+    )
+
+    result = agent_jobs.submit_job(
+        user_id=1,
+        agent_token_id=999,
+        kind="autoresearch_backtest",
+        request_payload={"symbol": "SOXL"},
+        runner=lambda payload: payload,
+        idempotency_key="same-key",
+    )
+
+    assert result["job_id"] == "job-existing"
+    assert result["status"] == "queued"
+    assert result["duplicate"] is True

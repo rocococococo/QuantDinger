@@ -88,6 +88,7 @@ class BacktestService:
     }
 
     ENGINE_VERSION = 'strategy-backtest-v1'
+    SUPPLIED_OHLCV_MAX_ROWS = 25_000
 
     def __init__(self):
         self._storage_schema_ready = False
@@ -247,6 +248,49 @@ class BacktestService:
         except Exception:
             equity = 0.0
         return round(-equity, 2)
+
+    def _position_sizing(self, strategy_config: Optional[Dict[str, Any]]) -> tuple[float, Optional[float]]:
+        cfg = strategy_config or {}
+        pos_cfg = cfg.get('position') or {}
+        raw_mode = pos_cfg.get('sizingMode') or pos_cfg.get('mode') or ''
+        sizing_mode = str(raw_mode).strip().lower()
+        raw_fixed_shares = (
+            pos_cfg.get('fixedShares')
+            if pos_cfg.get('fixedShares') is not None
+            else pos_cfg.get('shares')
+            if pos_cfg.get('shares') is not None
+            else pos_cfg.get('sizingValue')
+        )
+        fixed_shares = None
+        if sizing_mode in ('shares', 'fixed_shares', 'fixed-share', 'fixed') and raw_fixed_shares is not None:
+            try:
+                fixed_shares = max(0.0, float(raw_fixed_shares))
+            except (TypeError, ValueError):
+                fixed_shares = None
+
+        raw_entry_pct = pos_cfg.get('entryPct')
+        if raw_entry_pct is None or raw_entry_pct == 0:
+            entry_pct = 1.0
+        else:
+            entry_pct = float(raw_entry_pct)
+            if entry_pct > 1:
+                entry_pct = entry_pct / 100.0
+        return max(0.0, min(entry_pct, 1.0)), fixed_shares
+
+    def _entry_shares(
+        self,
+        *,
+        capital: float,
+        price: float,
+        leverage: int,
+        entry_pct: float,
+        fixed_shares: Optional[float],
+    ) -> float:
+        if fixed_shares is not None and fixed_shares > 0:
+            return fixed_shares
+        if price <= 0:
+            return 0.0
+        return (capital * entry_pct * leverage) / price
 
     def persist_run(
         self,
@@ -506,6 +550,8 @@ class BacktestService:
         indicator_params: Optional[Dict[str, Any]] = None,
         user_id: int = 1,
         indicator_id: Optional[int] = None,
+        ohlcv_rows: Optional[List[Dict[str, Any]]] = None,
+        ohlcv_provenance: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Multi-timeframe backtest.
@@ -555,11 +601,14 @@ class BacktestService:
             or signal_tf_seconds <= exec_tf_seconds
             or has_scale_rules
             or not timing_supported
+            or bool(ohlcv_rows)
         )
         
         if skip_mtf:
             fallback_reason = None
-            if has_scale_rules:
+            if ohlcv_rows:
+                fallback_reason = 'supplied_ohlcv'
+            elif has_scale_rules:
                 fallback_reason = 'scale_rules_not_supported_in_mtf'
             elif not timing_supported:
                 fallback_reason = 'signal_timing_not_supported_in_mtf'
@@ -590,13 +639,23 @@ class BacktestService:
                 indicator_params=indicator_params,
                 user_id=user_id,
                 indicator_id=indicator_id,
+                ohlcv_rows=ohlcv_rows,
+                ohlcv_provenance=ohlcv_provenance,
             )
-            result['precision_info'] = precision_info or {
-                'enabled': False,
-                'timeframe': timeframe,
-                'precision': 'standard',
-                'message': 'Using standard candle backtest'
-            }
+            if fallback_reason == 'supplied_ohlcv':
+                result['precision_info'] = {
+                    'enabled': False,
+                    'timeframe': timeframe,
+                    'precision': 'standard',
+                    'message': 'Using supplied OHLCV rows with standard candle backtest',
+                }
+            else:
+                result['precision_info'] = precision_info or {
+                    'enabled': False,
+                    'timeframe': timeframe,
+                    'precision': 'standard',
+                    'message': 'Using standard candle backtest'
+                }
             if fallback_reason:
                 result['precision_info']['fallback_reason'] = fallback_reason
                 if fallback_reason == 'scale_rules_not_supported_in_mtf':
@@ -653,6 +712,8 @@ class BacktestService:
                 indicator_params=indicator_params,
                 user_id=user_id,
                 indicator_id=indicator_id,
+                ohlcv_rows=ohlcv_rows,
+                ohlcv_provenance=ohlcv_provenance,
             )
             result['precision_info'] = {
                 'enabled': False,
@@ -839,17 +900,9 @@ class BacktestService:
             if trailing_activation_pct_eff <= 0 and take_profit_pct_eff > 0:
                 trailing_activation_pct_eff = take_profit_pct_eff
         
-        # Entry percentage
-        pos_cfg = cfg.get('position') or {}
-        raw_entry_pct = pos_cfg.get('entryPct')
-        # If entryPct is None, 0, or not provided, default to 1.0 (100%)
-        if raw_entry_pct is None or raw_entry_pct == 0:
-            entry_pct_cfg = 1.0
-        else:
-            entry_pct_cfg = float(raw_entry_pct)
-            if entry_pct_cfg > 1:
-                entry_pct_cfg = entry_pct_cfg / 100.0
-        entry_pct_cfg = max(0.01, min(entry_pct_cfg, 1.0))  # Minimum 1% to avoid 0 position
+        entry_pct_cfg, fixed_shares_cfg = self._position_sizing(strategy_config)
+        if fixed_shares_cfg is None:
+            entry_pct_cfg = max(0.01, entry_pct_cfg)
         
         logger.info(f"Trading params: capital={capital}, leverage={lev}, entry_pct={entry_pct_cfg}, strategy_config={cfg}")
         
@@ -1473,10 +1526,14 @@ class BacktestService:
                                 continue
                         
                         # Now open long
-                        use_capital = capital * entry_pct_cfg
-                        if exec_price > 0:
-                            shares = (use_capital * lev) / exec_price
-                        else:
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=lev,
+                            entry_pct=entry_pct_cfg,
+                            fixed_shares=fixed_shares_cfg,
+                        )
+                        if shares <= 0:
                             logger.warning(f"Invalid exec_price={exec_price} at {timestamp}, skipping open_long")
                             pending_signal = None
                             continue
@@ -1564,10 +1621,14 @@ class BacktestService:
                                 continue
                         
                         # Now open short
-                        use_capital = capital * entry_pct_cfg
-                        if exec_price > 0:
-                            shares = (use_capital * lev) / exec_price
-                        else:
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=lev,
+                            entry_pct=entry_pct_cfg,
+                            fixed_shares=fixed_shares_cfg,
+                        )
+                        if shares <= 0:
                             logger.warning(f"Invalid exec_price={exec_price} at {timestamp}, skipping open_short")
                             pending_signal = None
                             continue
@@ -1838,6 +1899,8 @@ class BacktestService:
         indicator_params: Optional[Dict[str, Any]] = None,
         user_id: int = 1,
         indicator_id: Optional[int] = None,
+        ohlcv_rows: Optional[List[Dict[str, Any]]] = None,
+        ohlcv_provenance: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Live-aligned backtest: strict → closed-bar signals + next-bar open;
@@ -1868,6 +1931,8 @@ class BacktestService:
                 indicator_params=indicator_params,
                 user_id=user_id,
                 indicator_id=indicator_id,
+                ohlcv_rows=ohlcv_rows,
+                ohlcv_provenance=ohlcv_provenance,
             )
             result['precision_info'] = precision_info_for_run(
                 strict_mode=True, strategy_timeframe=timeframe,
@@ -1882,7 +1947,7 @@ class BacktestService:
             result['executionAssumptions'] = ea
             return result
 
-        if mkt in ('crypto', 'cryptocurrency'):
+        if mkt in ('crypto', 'cryptocurrency') and not ohlcv_rows:
             result = self.run_multi_timeframe(
                 indicator_code=indicator_code,
                 market=market,
@@ -1900,6 +1965,7 @@ class BacktestService:
                 indicator_params=indicator_params,
                 user_id=user_id,
                 indicator_id=indicator_id,
+                ohlcv_provenance=ohlcv_provenance,
             )
             pi_raw = result.get('precision_info') or {}
             mtf_active = bool(pi_raw.get('enabled'))
@@ -1940,12 +2006,14 @@ class BacktestService:
             indicator_params=indicator_params,
             user_id=user_id,
             indicator_id=indicator_id,
+            ohlcv_rows=ohlcv_rows,
+            ohlcv_provenance=ohlcv_provenance,
         )
         result['precision_info'] = precision_info_for_run(
             strict_mode=False,
             strategy_timeframe=timeframe,
             mtf_active=False,
-            fallback_reason='non_crypto',
+            fallback_reason='supplied_ohlcv' if ohlcv_rows else 'non_crypto',
         )
         ea = dict(result.get('executionAssumptions') or {})
         ea['strictMode'] = False
@@ -1954,7 +2022,7 @@ class BacktestService:
         ea['simulationMode'] = 'aggressive_bar'
         ea['mtfRequested'] = False
         ea['mtfActive'] = False
-        ea['mtfFallbackReason'] = 'non_crypto'
+        ea['mtfFallbackReason'] = 'supplied_ohlcv' if ohlcv_rows else 'non_crypto'
         result['executionAssumptions'] = ea
         return result
 
@@ -1975,6 +2043,8 @@ class BacktestService:
         indicator_params: Optional[Dict[str, Any]] = None,
         user_id: int = 1,
         indicator_id: Optional[int] = None,
+        ohlcv_rows: Optional[List[Dict[str, Any]]] = None,
+        ohlcv_provenance: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run backtest.
@@ -1995,7 +2065,19 @@ class BacktestService:
         """
         
         # 1. Fetch candle data
-        df = self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
+        df = (
+            self._dataframe_from_supplied_ohlcv_rows(
+                ohlcv_rows,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                provenance=ohlcv_provenance,
+            )
+            if ohlcv_rows
+            else self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
+        )
         if df.empty:
             raise ValueError("No candle data available in the backtest date range")
         
@@ -2043,12 +2125,119 @@ class BacktestService:
         """因上游 K 线不足而缩短区间时，写入 executionAssumptions（供前端展示，非错误）。"""
         attrs = getattr(df, "attrs", None) or {}
         ar = attrs.get("backtestActualRange")
-        if not ar:
+        provenance = attrs.get("backtestMarketDataProvenance")
+        if not ar and not provenance:
             return
         ea = dict(result.get("executionAssumptions") or {})
-        ea["actualDataRange"] = ar
+        if ar:
+            ea["actualDataRange"] = ar
+        if provenance:
+            ea["marketDataProvenance"] = provenance
+            ea["marketDataSource"] = provenance.get("source")
+            ea["dataSourceMode"] = provenance.get("data_source_mode")
         ea["requestedRangeAdjusted"] = True
         result["executionAssumptions"] = ea
+
+    def _dataframe_from_supplied_ohlcv_rows(
+        self,
+        rows: Optional[List[Dict[str, Any]]],
+        *,
+        market: str,
+        symbol: str,
+        timeframe: str,
+        start_date: datetime,
+        end_date: datetime,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> pd.DataFrame:
+        if not rows:
+            return pd.DataFrame()
+        if len(rows) > self.SUPPLIED_OHLCV_MAX_ROWS:
+            raise ValueError(f"supplied OHLCV row count exceeds {self.SUPPLIED_OHLCV_MAX_ROWS}")
+        frame = pd.DataFrame([row for row in rows if isinstance(row, dict)]).copy()
+        if frame.empty:
+            return pd.DataFrame()
+        time_column = next((column for column in ("time", "timestamp", "datetime", "date") if column in frame.columns), "")
+        required = {"open", "high", "low", "close"}
+        if not time_column or any(column not in frame.columns for column in required):
+            raise ValueError("supplied OHLCV rows missing required columns")
+        if "volume" not in frame.columns:
+            frame["volume"] = 0.0
+        try:
+            timestamp = pd.to_datetime(frame[time_column], utc=True)
+        except Exception:
+            raise ValueError("supplied OHLCV rows contain invalid timestamps")
+        if timestamp.isna().any():
+            raise ValueError("supplied OHLCV rows contain invalid timestamps")
+        frame["time"] = timestamp.dt.tz_convert("UTC").dt.tz_localize(None)
+        for column in ("open", "high", "low", "close", "volume"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        numeric_columns = ["open", "high", "low", "close", "volume"]
+        if frame[numeric_columns].isna().any().any():
+            raise ValueError("supplied OHLCV rows contain non-numeric values")
+        if not np.isfinite(frame[numeric_columns].to_numpy(dtype=float)).all():
+            raise ValueError("supplied OHLCV rows contain non-finite values")
+        if (frame[["open", "high", "low", "close"]] <= 0).any().any():
+            raise ValueError("supplied OHLCV prices must be positive")
+        if (frame["volume"] < 0).any():
+            raise ValueError("supplied OHLCV volume must be non-negative")
+        if (frame["high"] < frame["low"]).any():
+            raise ValueError("supplied OHLCV high must be greater than or equal to low")
+        out_of_range = (
+            (frame["open"] < frame["low"])
+            | (frame["open"] > frame["high"])
+            | (frame["close"] < frame["low"])
+            | (frame["close"] > frame["high"])
+        )
+        if out_of_range.any():
+            raise ValueError("supplied OHLCV open and close must be within high-low range")
+        frame = frame.sort_values("time").drop_duplicates(subset=["time"], keep="last")
+        frame = frame.set_index("time")
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        filtered = frame[(frame.index >= start_ts) & (frame.index <= end_ts)].copy()
+        if filtered.empty:
+            return pd.DataFrame()
+        rows_hash = self._supplied_ohlcv_rows_hash(filtered)
+        filtered.attrs["backtestActualRange"] = {
+            "requestedStart": str(start_ts),
+            "requestedEnd": str(end_ts),
+            "actualStart": str(filtered.index.min()),
+            "actualEnd": str(filtered.index.max()),
+        }
+        metadata = dict(provenance or {})
+        metadata.setdefault("source", "supplied_ohlcv")
+        metadata.setdefault("data_source_mode", "supplied_ohlcv")
+        metadata.update({
+            "rows_hash": f"sha256:{rows_hash}",
+            "row_count": int(len(filtered)),
+            "market": str(market or ""),
+            "symbol": str(symbol or ""),
+            "timeframe": str(timeframe or ""),
+        })
+        filtered.attrs["backtestMarketDataProvenance"] = metadata
+        logger.info(
+            "[Backtest] Using supplied OHLCV rows "
+            f"{market}:{symbol} {timeframe} rows={len(filtered)} hash=sha256:{rows_hash[:12]}"
+        )
+        return filtered
+
+    @staticmethod
+    def _supplied_ohlcv_rows_hash(frame: pd.DataFrame) -> str:
+        rows = []
+        for timestamp, row in frame[["open", "high", "low", "close", "volume"]].iterrows():
+            rows.append(
+                {
+                    "time": str(timestamp),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                }
+            )
+        return hashlib.sha256(
+            json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
     
     def _fetch_kline_data(
         self,
@@ -2721,12 +2910,7 @@ class BacktestService:
             if trailing_activation_pct_eff <= 0 and take_profit_pct_eff > 0:
                 trailing_activation_pct_eff = take_profit_pct_eff
 
-        pos_cfg = cfg.get('position') or {}
-        entry_pct_cfg = float(pos_cfg.get('entryPct') or 1.0)  # expected 0~1
-        # Accept both 0~1 and 0~100 inputs (some clients may send percent units).
-        if entry_pct_cfg > 1:
-            entry_pct_cfg = entry_pct_cfg / 100.0
-        entry_pct_cfg = max(0.0, min(entry_pct_cfg, 1.0))
+        entry_pct_cfg, fixed_shares_cfg = self._position_sizing(strategy_config)
 
         scale_cfg = cfg.get('scale') or {}
         trend_add_cfg = scale_cfg.get('trendAdd') or {}
@@ -3516,17 +3700,30 @@ class BacktestService:
                         base_price = open_long_price_arr[i] if open_long_price_arr[i] > 0 else close
                     exec_price = base_price * (1 + slippage)
                     
-                    # Use specified pct (entryPct > position_size > full)
+                    # Use fixed shares when configured; otherwise use entryPct, position_size, then full.
                     position_pct = None
                     if entry_pct_cfg and entry_pct_cfg > 0:
                         position_pct = entry_pct_cfg
                     elif has_position_management and position_size_arr[i] > 0:
                         position_pct = position_size_arr[i]
-                    if position_pct is not None and position_pct > 0 and position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
+                    if fixed_shares_cfg is not None and fixed_shares_cfg > 0:
+                        shares = fixed_shares_cfg
+                    elif position_pct is not None and position_pct > 0 and position_pct < 1:
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=leverage,
+                            entry_pct=position_pct,
+                            fixed_shares=None,
+                        )
                     else:
-                        shares = (capital * leverage) / exec_price
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=leverage,
+                            entry_pct=1.0,
+                            fixed_shares=None,
+                        )
                     
                     commission_fee = shares * exec_price * commission
                     
@@ -3641,17 +3838,30 @@ class BacktestService:
                         base_price = open_short_price_arr[i] if open_short_price_arr[i] > 0 else close
                     exec_price = base_price * (1 - slippage)
                     
-                    # Use specified pct (entryPct > position_size > full)
+                    # Use fixed shares when configured; otherwise use entryPct, position_size, then full.
                     position_pct = None
                     if entry_pct_cfg and entry_pct_cfg > 0:
                         position_pct = entry_pct_cfg
                     elif has_position_management and position_size_arr[i] > 0:
                         position_pct = position_size_arr[i]
-                    if position_pct is not None and position_pct > 0 and position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
+                    if fixed_shares_cfg is not None and fixed_shares_cfg > 0:
+                        shares = fixed_shares_cfg
+                    elif position_pct is not None and position_pct > 0 and position_pct < 1:
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=leverage,
+                            entry_pct=position_pct,
+                            fixed_shares=None,
+                        )
                     else:
-                        shares = (capital * leverage) / exec_price
+                        shares = self._entry_shares(
+                            capital=capital,
+                            price=exec_price,
+                            leverage=leverage,
+                            entry_pct=1.0,
+                            fixed_shares=None,
+                        )
                     
                     commission_fee = shares * exec_price * commission
                     
@@ -4197,4 +4407,3 @@ class BacktestService:
             'equityCurve': cleaned_curve,
             'trades': cleaned_trades
         }
-

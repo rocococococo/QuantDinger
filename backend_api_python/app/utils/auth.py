@@ -90,6 +90,10 @@ def verify_token(token: str) -> dict:
     try:
         _configure_jwt_secret_warnings()
         payload = jwt.decode(token, Config.SECRET_KEY, algorithms=['HS256'])
+
+        # Single-user deployments use signed JWT authority without DB session state.
+        if _is_single_user_mode():
+            return payload
         
         # 验证 token_version（单一客户端登录控制）
         user_id = payload.get('user_id')

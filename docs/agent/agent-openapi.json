@@ -43,7 +43,7 @@
         "type": "object",
         "properties": {
           "job_id":      { "type": "string" },
-          "kind":        { "type": "string", "enum": ["backtest","experiment_pipeline","structured_tune","ai_optimize"] },
+          "kind":        { "type": "string", "enum": ["backtest","autoresearch_backtest","experiment_pipeline","structured_tune","ai_optimize"] },
           "status":      { "type": "string", "enum": ["queued","running","succeeded","failed","cancelled"] },
           "request":     { "type": "object" },
           "result":      { "type": "object" },
@@ -87,6 +87,76 @@
           "strict_mode":      { "type": "boolean", "description": "Alias for strictMode" },
           "strategy_config":  { "type": "object" },
           "indicator_params": { "type": "object" }
+        }
+      },
+      "AutoResearchBacktestRequest": {
+        "type": "object",
+        "allOf": [
+          { "anyOf": [
+            { "required": ["indicatorCode"] },
+            { "required": ["code"] },
+            { "required": ["indicator_code"] }
+          ] },
+          { "anyOf": [
+            { "required": ["market"] },
+            { "required": ["market_type"] }
+          ] },
+          { "anyOf": [
+            { "required": ["symbol"] },
+            { "required": ["instrument"] }
+          ] },
+          { "anyOf": [
+            { "required": ["timeframe"] },
+            { "required": ["interval"] }
+          ] },
+          { "anyOf": [
+            { "required": ["startDate"] },
+            { "required": ["startDateTime"] },
+            { "required": ["start_date"] },
+            { "required": ["start_date_time"] }
+          ] },
+          { "anyOf": [
+            { "required": ["endDate"] },
+            { "required": ["endDateTime"] },
+            { "required": ["end_date"] },
+            { "required": ["end_date_time"] }
+          ] }
+        ],
+        "properties": {
+          "indicatorCode":              { "type": "string", "description": "Indicator code (Python)" },
+          "code":                       { "type": "string", "description": "Alias for indicatorCode" },
+          "indicator_code":             { "type": "string", "description": "Alias for indicatorCode" },
+          "market":                     { "type": "string", "example": "USStock" },
+          "market_type":                { "type": "string", "description": "Alias for market" },
+          "symbol":                     { "type": "string", "example": "SOXL" },
+          "instrument":                 { "type": "string", "description": "Alias for symbol" },
+          "timeframe":                  { "type": "string", "example": "1m" },
+          "interval":                   { "type": "string", "description": "Alias for timeframe" },
+          "startDate":                  { "type": "string", "example": "2026-05-01" },
+          "endDate":                    { "type": "string", "example": "2026-05-01" },
+          "startDateTime":              { "type": "string", "format": "date-time" },
+          "endDateTime":                { "type": "string", "format": "date-time" },
+          "start_date":                 { "type": "string", "description": "Alias for startDate" },
+          "end_date":                   { "type": "string", "description": "Alias for endDate" },
+          "start_date_time":            { "type": "string", "format": "date-time", "description": "Alias for startDateTime" },
+          "end_date_time":              { "type": "string", "format": "date-time", "description": "Alias for endDateTime" },
+          "initialCapital":             { "type": "number", "default": 10000 },
+          "initial_capital":            { "type": "number", "description": "Alias for initialCapital" },
+          "commission":                 { "type": "number", "default": 0.001 },
+          "slippage":                   { "type": "number", "nullable": true },
+          "strictMode":                 { "type": "boolean", "default": true },
+          "strict_mode":                { "type": "boolean", "description": "Alias for strictMode" },
+          "strategyConfig":             { "type": "object" },
+          "strategy_config":            { "type": "object", "description": "Alias for strategyConfig" },
+          "indicator_params":           { "type": "object" },
+          "params":                     { "type": "object", "description": "Alias for indicator_params" },
+          "autoresearchTrace":          { "type": "object" },
+          "qd_native_validation_scope": { "type": "string", "enum": ["sampled_window","sampled_window_cost_stress"] },
+          "autoresearchOhlcvRows":      { "type": "array", "maxItems": 25000, "items": { "type": "object" } },
+          "costStressScenario":         { "type": "object" },
+          "costStressScenarioId":       { "type": "string" },
+          "sampleWindowPlanHash":       { "type": "string" },
+          "scenarioGridHash":           { "type": "string" }
         }
       },
       "IndicatorValidateRequest": {
@@ -229,6 +299,17 @@
         ],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BacktestRequest" } } } },
         "responses": { "202": { "description": "Queued" } }
+      }
+    },
+    "/api/agent/v1/autoresearch/backtests": {
+      "post": {
+        "summary": "Submit an AutoResearch-native backtest job",
+        "x-scope-class": "B",
+        "parameters": [
+          { "in": "header", "name": "Idempotency-Key", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AutoResearchBacktestRequest" } } } },
+        "responses": { "202": { "description": "Queued" }, "400": { "description": "Invalid request" }, "403": { "description": "Scope, market, or instrument denied" } }
       }
     },
     "/api/agent/v1/indicators/authoring-contract": {

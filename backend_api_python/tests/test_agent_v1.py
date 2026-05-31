@@ -157,3 +157,12 @@ def test_token_generator_format():
     other_token, _, other_hash = agent_auth.generate_token()
     assert token != other_token
     assert token_hash != other_hash
+
+
+def test_audit_idempotency_key_is_bounded(app):
+    with app.test_request_context(
+        "/api/agent/v1/autoresearch/backtests",
+        method="POST",
+        headers={"Idempotency-Key": "x" * 200},
+    ):
+        assert agent_auth._audit_idempotency_key() == "x" * agent_auth.MAX_IDEMPOTENCY_KEY_CHARS

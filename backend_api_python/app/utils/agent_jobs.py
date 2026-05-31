@@ -33,6 +33,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.utils.agent_auth import MAX_IDEMPOTENCY_KEY_CHARS, normalize_idempotency_key
 
 logger = get_logger(__name__)
 
@@ -93,24 +94,77 @@ def submit_job(
     results.  Each call is delivered to live SSE subscribers AND persisted on
     the job row so reconnecting clients can replay the latest snapshot.
     """
+    if idempotency_key is not None:
+        idempotency_key = normalize_idempotency_key(idempotency_key)
+        if not idempotency_key:
+            idempotency_key = None
+
     job_id = _new_job_id()
     created_at = datetime.utcnow()
+    idempotency_race = False
     with get_db_connection() as db:
         cur = db.cursor()
-        cur.execute(
-            """
-            INSERT INTO qd_agent_jobs
-              (job_id, user_id, agent_token_id, kind, status, request, idempotency_key, created_at)
-            VALUES (%s, %s, %s, %s, 'queued', %s::jsonb, %s, %s)
-            """,
-            (
-                job_id, int(user_id), agent_token_id, kind,
-                json.dumps(request_payload, default=str),
-                idempotency_key, created_at,
-            ),
+        try:
+            cur.execute(
+                """
+                INSERT INTO qd_agent_jobs
+                  (job_id, user_id, agent_token_id, kind, status, request, idempotency_key, created_at)
+                VALUES (%s, %s, %s, %s, 'queued', %s::jsonb, %s, %s)
+                """,
+                (
+                    job_id, int(user_id), agent_token_id, kind,
+                    json.dumps(request_payload, default=str),
+                    idempotency_key, created_at,
+                ),
+            )
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            if idempotency_key and _is_idempotency_unique_violation(exc):
+                idempotency_race = True
+            else:
+                raise
+        finally:
+            cur.close()
+    if idempotency_race:
+        existing = _existing_job_for_idempotency(
+            agent_token_id=agent_token_id,
+            kind=kind,
+            idempotency_key=idempotency_key,
         )
-        db.commit()
-        cur.close()
+        if existing:
+            existing["duplicate"] = True
+            return existing
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO qd_agent_jobs
+                      (job_id, user_id, agent_token_id, kind, status, request, idempotency_key, created_at)
+                    VALUES (%s, %s, %s, %s, 'queued', %s::jsonb, %s, %s)
+                    """,
+                    (
+                        job_id, int(user_id), agent_token_id, kind,
+                        json.dumps(request_payload, default=str),
+                        idempotency_key, created_at,
+                    ),
+                )
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                if idempotency_key and _is_idempotency_unique_violation(exc):
+                    existing = _existing_job_for_idempotency(
+                        agent_token_id=agent_token_id,
+                        kind=kind,
+                        idempotency_key=idempotency_key,
+                    )
+                    if existing:
+                        existing["duplicate"] = True
+                        return existing
+                raise
+            finally:
+                cur.close()
 
     accepts_progress = _runner_accepts_progress(runner)
 
@@ -147,6 +201,55 @@ def submit_job(
         "status": "queued",
         "kind": kind,
         "created_at": created_at.isoformat() + "Z",
+    }
+
+
+def _is_idempotency_unique_violation(exc: Exception) -> bool:
+    pgcode = getattr(exc, "pgcode", "")
+    text = str(exc)
+    return (
+        pgcode == "23505"
+        or "idx_agent_jobs_idem" in text
+        or "duplicate key value violates unique constraint" in text
+    )
+
+
+def _existing_job_for_idempotency(*, agent_token_id: Optional[int], kind: str, idempotency_key: str) -> Optional[dict]:
+    if not agent_token_id or not idempotency_key:
+        return None
+    if len(idempotency_key) > MAX_IDEMPOTENCY_KEY_CHARS:
+        return None
+    with get_db_connection() as db:
+        cur = db.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT job_id, status, kind, created_at
+                FROM qd_agent_jobs
+                WHERE agent_token_id = %s AND kind = %s AND idempotency_key = %s
+                ORDER BY id DESC LIMIT 1
+                """,
+                (agent_token_id, kind, idempotency_key),
+            )
+            row = cur.fetchone()
+        finally:
+            cur.close()
+    if not row:
+        return None
+    if isinstance(row, dict):
+        created_at = row.get("created_at")
+        return {
+            "job_id": row.get("job_id"),
+            "status": row.get("status"),
+            "kind": row.get("kind") or kind,
+            "created_at": created_at.isoformat() + "Z" if hasattr(created_at, "isoformat") else created_at,
+        }
+    created_at = row[3] if len(row) > 3 else None
+    return {
+        "job_id": row[0],
+        "status": row[1],
+        "kind": row[2] if len(row) > 2 else kind,
+        "created_at": created_at.isoformat() + "Z" if hasattr(created_at, "isoformat") else created_at,
     }
 
 
