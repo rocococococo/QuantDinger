@@ -249,6 +249,51 @@ class BacktestService:
             equity = 0.0
         return round(-equity, 2)
 
+    def _commission_fee(
+        self,
+        quantity: Any,
+        price: Any,
+        commission: Any,
+        strategy_config: Optional[Dict[str, Any]],
+    ) -> float:
+        exec_cfg = (strategy_config or {}).get('execution') or {}
+        model = str(exec_cfg.get('commission_model') or exec_cfg.get('commissionModel') or '').strip().lower()
+        if model == 'fixed':
+            raw_fixed = (
+                exec_cfg.get('commission_value')
+                if exec_cfg.get('commission_value') is not None
+                else exec_cfg.get('commissionValue')
+                if exec_cfg.get('commissionValue') is not None
+                else exec_cfg.get('commission')
+                if exec_cfg.get('commission') is not None
+                else commission
+            )
+            try:
+                return max(0.0, float(raw_fixed or 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+        try:
+            return abs(float(quantity or 0.0)) * float(price or 0.0) * max(0.0, float(commission or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _populate_missing_trade_commissions(
+        self,
+        trades: list[dict[str, Any]],
+        *,
+        commission: Any,
+        strategy_config: Optional[Dict[str, Any]],
+    ) -> None:
+        for trade in trades:
+            if not isinstance(trade, dict) or "commission" in trade:
+                continue
+            if str(trade.get("type") or "").strip() == "liquidation":
+                continue
+            trade["commission"] = round(
+                self._commission_fee(trade.get("amount"), trade.get("price"), commission, strategy_config),
+                6,
+            )
+
     def _position_sizing(self, strategy_config: Optional[Dict[str, Any]]) -> tuple[float, Optional[float]]:
         cfg = strategy_config or {}
         pos_cfg = cfg.get('position') or {}
@@ -1286,7 +1331,7 @@ class BacktestService:
                             sl_price = entry_price * (1 - stop_loss_pct_eff)
                             if path_price <= sl_price:
                                 exec_price = sl_price * (1 - slippage)
-                                commission_fee = position * exec_price * commission
+                                commission_fee = self._commission_fee(position, exec_price, commission, strategy_config)
                                 profit = (exec_price - entry_price) * position - commission_fee
                                 capital += profit
                                 if capital < 0:
@@ -1317,7 +1362,7 @@ class BacktestService:
                                 tr_price = highest_since_entry * (1 - trailing_pct_eff)
                                 if path_price <= tr_price:
                                     exec_price = tr_price * (1 - slippage)
-                                    commission_fee = position * exec_price * commission
+                                    commission_fee = self._commission_fee(position, exec_price, commission, strategy_config)
                                     profit = (exec_price - entry_price) * position - commission_fee
                                     capital += profit
                                     total_commission_paid += commission_fee
@@ -1341,7 +1386,7 @@ class BacktestService:
                             tp_price = entry_price * (1 + take_profit_pct_eff)
                             if path_price >= tp_price:
                                 exec_price = tp_price * (1 - slippage)
-                                commission_fee = position * exec_price * commission
+                                commission_fee = self._commission_fee(position, exec_price, commission, strategy_config)
                                 profit = (exec_price - entry_price) * position - commission_fee
                                 capital += profit
                                 total_commission_paid += commission_fee
@@ -1371,7 +1416,7 @@ class BacktestService:
                             sl_price = entry_price * (1 + stop_loss_pct_eff)
                             if path_price >= sl_price:
                                 exec_price = sl_price * (1 + slippage)
-                                commission_fee = shares * exec_price * commission
+                                commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                                 profit = (entry_price - exec_price) * shares - commission_fee
                                 if capital + profit <= 0:
                                     liquidation_loss = self._liquidation_loss(capital)
@@ -1413,7 +1458,7 @@ class BacktestService:
                                 tr_price = lowest_since_entry * (1 + trailing_pct_eff)
                                 if path_price >= tr_price:
                                     exec_price = tr_price * (1 + slippage)
-                                    commission_fee = shares * exec_price * commission
+                                    commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                                     profit = (entry_price - exec_price) * shares - commission_fee
                                     if capital + profit <= 0:
                                         liquidation_loss = self._liquidation_loss(capital)
@@ -1451,7 +1496,7 @@ class BacktestService:
                             tp_price = entry_price * (1 - take_profit_pct_eff)
                             if path_price <= tp_price:
                                 exec_price = tp_price * (1 + slippage)
-                                commission_fee = shares * exec_price * commission
+                                commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                                 profit = (entry_price - exec_price) * shares - commission_fee
                                 capital += profit
                                 total_commission_paid += commission_fee
@@ -1498,7 +1543,7 @@ class BacktestService:
                         if both_mode_active and position < 0:
                             shares_to_close = abs(position)
                             close_price = ref_px * (1 + slippage)
-                            close_commission = shares_to_close * close_price * commission
+                            close_commission = self._commission_fee(shares_to_close, close_price, commission, strategy_config)
                             close_profit = (entry_price - close_price) * shares_to_close - close_commission
                             capital += close_profit
                             if capital < 0:
@@ -1537,7 +1582,7 @@ class BacktestService:
                             logger.warning(f"Invalid exec_price={exec_price} at {timestamp}, skipping open_long")
                             pending_signal = None
                             continue
-                        commission_fee = shares * exec_price * commission
+                        commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                         capital -= commission_fee
                         total_commission_paid += commission_fee
                         position = shares
@@ -1561,7 +1606,7 @@ class BacktestService:
                     
                     elif pending_signal == 'close_long' and position > 0:
                         exec_price = ref_px * (1 - slippage)
-                        commission_fee = position * exec_price * commission
+                        commission_fee = self._commission_fee(position, exec_price, commission, strategy_config)
                         profit = (exec_price - entry_price) * position - commission_fee
                         capital += profit
                         if capital < 0:
@@ -1593,7 +1638,7 @@ class BacktestService:
                         # If in both mode and have long position, close it first
                         if both_mode_active and position > 0:
                             close_price = ref_px * (1 - slippage)
-                            close_commission = position * close_price * commission
+                            close_commission = self._commission_fee(position, close_price, commission, strategy_config)
                             close_profit = (close_price - entry_price) * position - close_commission
                             capital += close_profit
                             if capital < 0:
@@ -1632,7 +1677,7 @@ class BacktestService:
                             logger.warning(f"Invalid exec_price={exec_price} at {timestamp}, skipping open_short")
                             pending_signal = None
                             continue
-                        commission_fee = shares * exec_price * commission
+                        commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                         capital -= commission_fee
                         total_commission_paid += commission_fee
                         position = -shares
@@ -1657,7 +1702,7 @@ class BacktestService:
                     elif pending_signal == 'close_short' and position < 0:
                         shares = abs(position)
                         exec_price = ref_px * (1 + slippage)
-                        commission_fee = shares * exec_price * commission
+                        commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                         profit = (entry_price - exec_price) * shares - commission_fee
                         capital += profit
                         if capital < 0:
@@ -1721,6 +1766,11 @@ class BacktestService:
 
         self._annotate_signal_bar_times(trades, signal_tf_seconds, signal_timing)
 
+        self._populate_missing_trade_commissions(
+            trades,
+            commission=commission,
+            strategy_config=strategy_config,
+        )
         return equity_curve, trades, total_commission_paid, total_funding_paid
 
     def run_strategy_snapshot(
@@ -3089,7 +3139,7 @@ class BacktestService:
                         pri = {'close_long_stop': 0, 'close_long_trailing': 1, 'close_long_profit': 2}
                         trade_type, trigger_price = sorted(candidates, key=lambda x: (pri.get(x[0], 99), x[1]))[0]
                         exec_price_close = trigger_price * (1 - slippage)
-                        commission_fee_close = position * exec_price_close * commission
+                        commission_fee_close = self._commission_fee(position, exec_price_close, commission, strategy_config)
                         # Entry commission deducted, only deduct exit commission
                         profit = (exec_price_close - entry_price) * position - commission_fee_close
                         capital += profit
@@ -3140,7 +3190,7 @@ class BacktestService:
                         pri = {'close_short_stop': 0, 'close_short_trailing': 1, 'close_short_profit': 2}
                         trade_type, trigger_price = sorted(candidates, key=lambda x: (pri.get(x[0], 99), -x[1]))[0]
                         exec_price_close = trigger_price * (1 + slippage)
-                        commission_fee_close = shares * exec_price_close * commission
+                        commission_fee_close = self._commission_fee(shares, exec_price_close, commission, strategy_config)
                         # Entry commission deducted, only deduct exit commission
                         profit = (entry_price - exec_price_close) * shares - commission_fee_close
 
@@ -3193,7 +3243,7 @@ class BacktestService:
                 else:
                     target_price = close_long_price_arr[i] if close_long_price_arr[i] > 0 else close
                 exec_price = target_price * (1 - slippage)
-                commission_fee = position * exec_price * commission
+                commission_fee = self._commission_fee(position, exec_price, commission, strategy_config)
                 profit = (exec_price - entry_price) * position - commission_fee
                 capital += profit
                 total_commission_paid += commission_fee
@@ -3210,6 +3260,7 @@ class BacktestService:
                     'price': round(exec_price, 4),
                     'amount': round(position, 4),
                     'profit': round(profit, 2),
+                    'commission': round(commission_fee, 6),
                     'balance': round(max(0, capital), 2)
                 })
                 
@@ -3243,7 +3294,7 @@ class BacktestService:
                     target_price = close_short_price_arr[i] if close_short_price_arr[i] > 0 else close
                 exec_price = target_price * (1 + slippage)
                 shares = abs(position)
-                commission_fee = shares * exec_price * commission
+                commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                 profit = (entry_price - exec_price) * shares - commission_fee
                 
                 if capital + profit <= 0:
@@ -3324,7 +3375,7 @@ class BacktestService:
                                 use_capital = capital * order_pct
                                 # Commission from notional value
                                 shares_add = (use_capital * leverage) / exec_price_add
-                                commission_fee = shares_add * exec_price_add * commission
+                                commission_fee = self._commission_fee(shares_add, exec_price_add, commission, strategy_config)
 
                                 total_cost_before = position * entry_price
                                 total_cost_after = total_cost_before + shares_add * exec_price_add
@@ -3357,7 +3408,7 @@ class BacktestService:
                                 exec_price_add = trigger * (1 + slippage)
                                 use_capital = capital * order_pct
                                 shares_add = (use_capital * leverage) / exec_price_add
-                                commission_fee = shares_add * exec_price_add * commission
+                                commission_fee = self._commission_fee(shares_add, exec_price_add, commission, strategy_config)
 
                                 total_cost_before = position * entry_price
                                 total_cost_after = total_cost_before + shares_add * exec_price_add
@@ -3389,7 +3440,7 @@ class BacktestService:
                             reduce_shares = position * reduce_pct
                             if reduce_shares > 0:
                                 exec_price_reduce = trigger * (1 - slippage)
-                                commission_fee = reduce_shares * exec_price_reduce * commission
+                                commission_fee = self._commission_fee(reduce_shares, exec_price_reduce, commission, strategy_config)
                                 profit = (exec_price_reduce - entry_price) * reduce_shares - commission_fee
                                 capital += profit
                                 total_commission_paid += commission_fee
@@ -3422,7 +3473,7 @@ class BacktestService:
                             reduce_shares = position * reduce_pct
                             if reduce_shares > 0:
                                 exec_price_reduce = trigger * (1 - slippage)
-                                commission_fee = reduce_shares * exec_price_reduce * commission
+                                commission_fee = self._commission_fee(reduce_shares, exec_price_reduce, commission, strategy_config)
                                 profit = (exec_price_reduce - entry_price) * reduce_shares - commission_fee
                                 capital += profit
                                 total_commission_paid += commission_fee
@@ -3460,7 +3511,7 @@ class BacktestService:
                                 exec_price_add = trigger * (1 - slippage)  # Sell to add short, slippage unfavorable
                                 use_capital = capital * order_pct
                                 shares_add = (use_capital * leverage) / exec_price_add
-                                commission_fee = shares_add * exec_price_add * commission
+                                commission_fee = self._commission_fee(shares_add, exec_price_add, commission, strategy_config)
 
                                 total_cost_before = shares_total * entry_price
                                 total_cost_after = total_cost_before + shares_add * exec_price_add
@@ -3494,7 +3545,7 @@ class BacktestService:
                                 exec_price_add = trigger * (1 - slippage)
                                 use_capital = capital * order_pct
                                 shares_add = (use_capital * leverage) / exec_price_add
-                                commission_fee = shares_add * exec_price_add * commission
+                                commission_fee = self._commission_fee(shares_add, exec_price_add, commission, strategy_config)
 
                                 total_cost_before = shares_total * entry_price
                                 total_cost_after = total_cost_before + shares_add * exec_price_add
@@ -3527,7 +3578,7 @@ class BacktestService:
                             reduce_shares = shares_total * reduce_pct
                             if reduce_shares > 0:
                                 exec_price_reduce = trigger * (1 + slippage)  # Cover more expensive
-                                commission_fee = reduce_shares * exec_price_reduce * commission
+                                commission_fee = self._commission_fee(reduce_shares, exec_price_reduce, commission, strategy_config)
                                 profit = (entry_price - exec_price_reduce) * reduce_shares - commission_fee
                                 capital += profit
                                 total_commission_paid += commission_fee
@@ -3561,7 +3612,7 @@ class BacktestService:
                             reduce_shares = shares_total * reduce_pct
                             if reduce_shares > 0:
                                 exec_price_reduce = trigger * (1 + slippage)
-                                commission_fee = reduce_shares * exec_price_reduce * commission
+                                commission_fee = self._commission_fee(reduce_shares, exec_price_reduce, commission, strategy_config)
                                 profit = (entry_price - exec_price_reduce) * reduce_shares - commission_fee
                                 capital += profit
                                 total_commission_paid += commission_fee
@@ -3597,7 +3648,7 @@ class BacktestService:
                     position_pct = position_size_arr[i] if position_size_arr[i] > 0 else 0.1
                     use_capital = capital * position_pct
                     shares = (use_capital * leverage) / exec_price
-                    commission_fee = shares * exec_price * commission
+                    commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                     
                     # Update average cost
                     total_cost_before = position * entry_price
@@ -3629,7 +3680,7 @@ class BacktestService:
                     position_pct = position_size_arr[i] if position_size_arr[i] > 0 else 0.1
                     use_capital = capital * position_pct
                     shares = (use_capital * leverage) / exec_price
-                    commission_fee = shares * exec_price * commission
+                    commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                     
                     # Update average cost
                     current_shares = abs(position)
@@ -3664,7 +3715,7 @@ class BacktestService:
                     if both_mode_active and position < 0:
                         shares_to_close = abs(position)
                         close_price = open_ * (1 + slippage)
-                        close_commission = shares_to_close * close_price * commission
+                        close_commission = self._commission_fee(shares_to_close, close_price, commission, strategy_config)
                         close_profit = (entry_price - close_price) * shares_to_close - close_commission
                         capital += close_profit
                         if capital < 0:
@@ -3725,7 +3776,7 @@ class BacktestService:
                             fixed_shares=None,
                         )
                     
-                    commission_fee = shares * exec_price * commission
+                    commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                     
                     position = shares
                     entry_price = exec_price
@@ -3746,6 +3797,7 @@ class BacktestService:
                         'price': round(exec_price, 4),
                         'amount': round(shares, 4),
                         'profit': 0,
+                        'commission': round(commission_fee, 6),
                         'balance': round(max(0, capital), 2)
                     })
                     
@@ -3773,7 +3825,7 @@ class BacktestService:
                             else:
                                 # Stop-loss triggers first.
                                 exec_price_close = sl_price * (1 - slippage)
-                                commission_fee_close = position * exec_price_close * commission
+                                commission_fee_close = self._commission_fee(position, exec_price_close, commission, strategy_config)
                                 profit = (exec_price_close - entry_price) * position - commission_fee_close
                                 capital += profit
                                 total_commission_paid += commission_fee_close
@@ -3802,7 +3854,7 @@ class BacktestService:
                     # In both mode with long position, close it first
                     if both_mode_active and position > 0:
                         close_price = open_ * (1 - slippage)
-                        close_commission = position * close_price * commission
+                        close_commission = self._commission_fee(position, close_price, commission, strategy_config)
                         close_profit = (close_price - entry_price) * position - close_commission
                         capital += close_profit
                         if capital < 0:
@@ -3863,7 +3915,7 @@ class BacktestService:
                             fixed_shares=None,
                         )
                     
-                    commission_fee = shares * exec_price * commission
+                    commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                     
                     position = -shares
                     entry_price = exec_price
@@ -3910,7 +3962,7 @@ class BacktestService:
                                 # Stop-loss triggers first.
                                 exec_price_close = sl_price * (1 + slippage)
                                 shares_close = abs(position)
-                                commission_fee_close = shares_close * exec_price_close * commission
+                                commission_fee_close = self._commission_fee(shares_close, exec_price_close, commission, strategy_config)
                                 profit = (entry_price - exec_price_close) * shares_close - commission_fee_close
                                 capital += profit
                                 total_commission_paid += commission_fee_close
@@ -3947,7 +3999,7 @@ class BacktestService:
                     if has_stop_loss and stop_loss_price > liquidation_price:
                         # SL triggers before liquidation
                         exec_price_close = stop_loss_price * (1 - slippage)
-                        commission_fee_close = position * exec_price_close * commission
+                        commission_fee_close = self._commission_fee(position, exec_price_close, commission, strategy_config)
                         profit = (exec_price_close - entry_price) * position - commission_fee_close
                         capital += profit
                         total_commission_paid += commission_fee_close
@@ -3994,7 +4046,7 @@ class BacktestService:
                         # SL triggers before liquidation
                         exec_price_close = stop_loss_price * (1 + slippage)
                         shares_close = abs(position)
-                        commission_fee_close = shares_close * exec_price_close * commission
+                        commission_fee_close = self._commission_fee(shares_close, exec_price_close, commission, strategy_config)
                         profit = (entry_price - exec_price_close) * shares_close - commission_fee_close
                         capital += profit
                         total_commission_paid += commission_fee_close
@@ -4054,7 +4106,7 @@ class BacktestService:
             
             if position > 0:  # Close long
                 exec_price = final_close * (1 - slippage)
-                commission_fee = position * exec_price * commission
+                commission_fee = self._commission_fee(position, exec_price, commission, strategy_config)
                 profit = (exec_price - entry_price) * position - commission_fee
                 capital += profit
                 total_commission_paid += commission_fee
@@ -4070,7 +4122,7 @@ class BacktestService:
             else:  # Close short
                 exec_price = final_close * (1 + slippage)
                 shares = abs(position)
-                commission_fee = shares * exec_price * commission
+                commission_fee = self._commission_fee(shares, exec_price, commission, strategy_config)
                 profit = (entry_price - exec_price) * shares - commission_fee
                 
                 if capital + profit <= 0:
@@ -4101,6 +4153,11 @@ class BacktestService:
             if equity_curve:
                 equity_curve[-1]['value'] = round(capital, 2)
         
+        self._populate_missing_trade_commissions(
+            trades,
+            commission=commission,
+            strategy_config=strategy_config,
+        )
         return equity_curve, trades, total_commission_paid
     
     def _calculate_metrics(

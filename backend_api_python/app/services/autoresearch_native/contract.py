@@ -31,12 +31,13 @@ def autoresearch_compatibility_backtest_enabled() -> bool:
 def capabilities_payload() -> dict[str, Any]:
     """Return the QD-hosted AutoResearch capability contract."""
     compatibility_enabled = autoresearch_compatibility_backtest_enabled()
+    backtest_path = AUTORESEARCH_COMPATIBILITY_BACKTEST_PATH if compatibility_enabled else AUTORESEARCH_AGENT_BACKTEST_PATH
     return {
         "status": "ok",
-        "local_compat": compatibility_enabled,
+        "local_compat": False,
         "native_engine": True,
         "supports_sampled_window_cost_stress": True,
-        "backtest_path": AUTORESEARCH_BACKTEST_PATH,
+        "backtest_path": backtest_path,
         "agent_backtest_path": AUTORESEARCH_AGENT_BACKTEST_PATH,
         "compatibility_backtest_path": AUTORESEARCH_COMPATIBILITY_BACKTEST_PATH,
         "compatibility_backtest_enabled": compatibility_enabled,
@@ -359,10 +360,12 @@ def cost_stress_payload(
         reasons.append("qd_native_cost_stress_total_return_not_positive")
     min_equity = observed.get("min_equity")
     equity_floor = observed.get("equity_floor")
-    if min_equity is not None and equity_floor is not None and min_equity < equity_floor:
-        reasons.append("qd_native_cost_stress_equity_floor_breached")
-    if min_equity is not None and equity_floor is None and min_equity <= 0.0:
-        reasons.append("qd_native_cost_stress_equity_floor_breached")
+    equity_basis = str(observed.get("equity_basis") or "").strip()
+    if equity_basis != "validation_window_relative_pnl":
+        if min_equity is not None and equity_floor is not None and min_equity < equity_floor:
+            reasons.append("qd_native_cost_stress_equity_floor_breached")
+        if min_equity is not None and equity_floor is None and min_equity <= 0.0:
+            reasons.append("qd_native_cost_stress_equity_floor_breached")
     return {
         "contract_version": AUTORESEARCH_COST_STRESS_CONTRACT,
         "authority": "qd-native",

@@ -36,6 +36,18 @@ def test_capabilities_payload_reports_hosted_native_cost_stress():
     assert "sampled_window_cost_stress" in payload["capabilities"]
 
 
+def test_capabilities_payload_keeps_native_target_when_compatibility_backtest_enabled(monkeypatch):
+    monkeypatch.setenv("AUTORESEARCH_NATIVE_COMPAT_ENABLED", "true")
+
+    payload = capabilities_payload()
+
+    assert payload["local_compat"] is False
+    assert payload["native_engine"] is True
+    assert payload["backtest_path"] == "/api/autoresearch/indicator-backtest"
+    assert payload["compatibility_backtest_enabled"] is True
+    assert payload["compatibility_backtest_path"] == "/api/autoresearch/indicator-backtest"
+
+
 def test_autoresearch_capabilities_endpoint(client):
     resp = client.get("/api/autoresearch/capabilities")
 
@@ -269,7 +281,7 @@ def test_validation_window_metrics_exclude_execution_warmup():
     ]
 
 
-def test_cost_stress_blocks_relative_equity_floor_breach():
+def test_cost_stress_allows_underwater_relative_pnl_when_window_finishes_profitable():
     data = {
         "qd_native_validation_scope": "sampled_window_cost_stress",
         "sampleWindowPlanHash": "sha256:sample-plan",
@@ -298,9 +310,9 @@ def test_cost_stress_blocks_relative_equity_floor_breach():
         execution={},
     )
 
-    assert payload["passed"] is False
+    assert payload["passed"] is True
     assert payload["observed"]["min_equity"] == -1.0
-    assert "qd_native_cost_stress_equity_floor_breached" in payload["blocking_reasons"]
+    assert "qd_native_cost_stress_equity_floor_breached" not in payload["blocking_reasons"]
 
 
 def test_native_run_id_is_stable_for_ephemeral_runs():
@@ -526,6 +538,92 @@ def test_autoresearch_adapter_passes_provenance_to_host_seam():
     assert captured["ohlcv_provenance"]["independent_from_autoresearch_payload"] is False
 
 
+def test_autoresearch_adapter_passes_cost_stress_execution_to_host_strategy_config():
+    captured = {}
+
+    class FakeBacktestService:
+        def run_aligned(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "executionAssumptions": {},
+                "totalProfit": 0.0,
+                "totalReturn": 0.0,
+                "maxDrawdown": 0.0,
+                "totalTrades": 0,
+                "equityCurve": [],
+                "trades": [],
+            }
+
+    run_autoresearch_backtest(
+        {
+            "indicatorCode": "df['buy'] = False\ndf['sell'] = False\n",
+            "symbol": "SOXL",
+            "market": "USStock",
+            "timeframe": "1m",
+            "startDate": "2026-05-01",
+            "endDate": "2026-05-01",
+            "strictMode": False,
+            "strategyConfig": {"position": {"sizingMode": "shares", "sizingValue": 10}},
+            "qd_native_validation_scope": "sampled_window_cost_stress",
+            "costStressScenario": {
+                "execution": {
+                    "fill_model": "next_bar_open",
+                    "commission_model": "fixed",
+                    "commission_value": 0.01,
+                    "slippage_model": "bps",
+                    "slippage_bps": 2.0,
+                }
+            },
+        },
+        backtest_service=FakeBacktestService(),
+    )
+
+    execution = captured["strategy_config"]["execution"]
+    assert execution["commission_model"] == "fixed"
+    assert execution["commission_value"] == 0.01
+    assert execution["slippage_model"] == "bps"
+    assert execution["slippage_bps"] == 2.0
+
+
+def test_autoresearch_adapter_echoes_trace_identity_for_native_hash_checks():
+    class FakeBacktestService:
+        def run_aligned(self, **_kwargs):
+            return {
+                "executionAssumptions": {},
+                "totalProfit": 0.0,
+                "totalReturn": 0.0,
+                "maxDrawdown": 0.0,
+                "totalTrades": 0,
+                "equityCurve": [],
+                "trades": [],
+            }
+
+    response = run_autoresearch_backtest(
+        {
+            "indicatorCode": "df['buy'] = False\ndf['sell'] = False\n",
+            "symbol": "SOXL",
+            "market": "USStock",
+            "timeframe": "1m",
+            "startDate": "2026-05-01",
+            "endDate": "2026-05-01",
+            "autoresearchTrace": {
+                "run_id": "ar-run-001",
+                "candidate_id": "candidate-001",
+                "source_surface": "terminal_gate_runner",
+                "strategy_ir_sha256": "sha256:ir",
+                "qd_code_sha256": "sha256:code",
+                "benchmark_set_hash": "sha256:bench",
+            },
+            "qd_native_validation_scope": "sampled_window",
+        },
+        backtest_service=FakeBacktestService(),
+    )
+
+    assert response["trace"]["strategy_ir_sha256"] == "sha256:ir"
+    assert response["trace"]["qd_code_sha256"] == "sha256:code"
+    assert response["trace"]["qd_native_validation_scope"] == "sampled_window"
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
@@ -590,6 +688,101 @@ def test_fixed_share_position_sizing_uses_configured_share_count():
     assert trades[0]["amount"] == 10.0
     assert trades[1]["type"] == "close_long"
     assert trades[1]["amount"] == 10.0
+
+
+def test_fixed_commission_model_charges_per_fill_amount():
+    index = pd.to_datetime(
+        [
+            "2026-05-01T13:30:00Z",
+            "2026-05-01T14:30:00Z",
+        ]
+    )
+    df = pd.DataFrame(
+        {
+            "open": [100.0, 101.0],
+            "high": [100.0, 101.0],
+            "low": [100.0, 101.0],
+            "close": [100.0, 101.0],
+            "volume": [1000, 1000],
+        },
+        index=index,
+    )
+    signals = {
+        "buy": pd.Series([True, False], index=index),
+        "sell": pd.Series([False, True], index=index),
+    }
+
+    _, trades, total_commission = BacktestService()._simulate_trading(
+        df=df,
+        signals=signals,
+        initial_capital=10000.0,
+        commission=0.01,
+        slippage=0.0,
+        leverage=1,
+        trade_direction="long",
+        strategy_config={
+            "position": {"sizingMode": "shares", "sizingValue": 10},
+            "execution": {
+                "signalTiming": "same_bar_close",
+                "commission_model": "fixed",
+                "commission_value": 0.01,
+            },
+        },
+    )
+
+    assert total_commission == pytest.approx(0.02)
+    assert trades[0]["type"] == "open_long"
+    assert trades[0]["balance"] == pytest.approx(9999.99)
+    assert trades[0]["commission"] == pytest.approx(0.01)
+    assert trades[1]["type"] == "close_long"
+    assert trades[1]["profit"] == pytest.approx(9.99)
+    assert trades[1]["commission"] == pytest.approx(0.01)
+
+
+def test_fixed_commission_model_reports_forced_exit_commission():
+    index = pd.to_datetime(
+        [
+            "2026-05-01T13:30:00Z",
+            "2026-05-01T14:30:00Z",
+        ]
+    )
+    df = pd.DataFrame(
+        {
+            "open": [100.0, 100.0],
+            "high": [100.0, 100.0],
+            "low": [100.0, 94.0],
+            "close": [100.0, 96.0],
+            "volume": [1000, 1000],
+        },
+        index=index,
+    )
+    signals = {
+        "buy": pd.Series([True, False], index=index),
+        "sell": pd.Series([False, False], index=index),
+    }
+
+    _, trades, total_commission = BacktestService()._simulate_trading(
+        df=df,
+        signals=signals,
+        initial_capital=10000.0,
+        commission=0.01,
+        slippage=0.0,
+        leverage=1,
+        trade_direction="long",
+        strategy_config={
+            "position": {"sizingMode": "shares", "sizingValue": 10},
+            "risk": {"stopLossPct": 0.05},
+            "execution": {
+                "signalTiming": "same_bar_close",
+                "commission_model": "fixed",
+                "commission_value": 0.01,
+            },
+        },
+    )
+
+    assert total_commission == pytest.approx(0.02)
+    assert [trade["type"] for trade in trades] == ["open_long", "close_long_stop"]
+    assert [trade["commission"] for trade in trades] == pytest.approx([0.01, 0.01])
 
 
 def test_single_user_mode_accepts_signed_token_without_db_token_version(monkeypatch):

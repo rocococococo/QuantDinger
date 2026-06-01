@@ -68,6 +68,9 @@ def run_autoresearch_backtest(
     slippage_default = default_slippage_if_missing(data.get("slippage"))
     slippage = request_slippage(data, execution, default=slippage_default)
     ohlcv_rows = supplied_ohlcv_rows(data)
+    if execution:
+        strategy_config = dict(strategy_config)
+        strategy_config["execution"] = {**first_mapping(strategy_config.get("execution")), **execution}
     strategy_config = merge_strict_mode_into_strategy_config(strategy_config, strict_mode)
 
     result = service.run_aligned(
@@ -145,12 +148,15 @@ def run_autoresearch_backtest(
         )
 
     qd_native_run_id = native_run_id(data, result, run_id)
+    trace = _autoresearch_trace_identity(data)
     response = {
         "runId": run_id,
         "nativeRunId": qd_native_run_id,
         "persistenceStatus": "persisted" if run_id is not None else "ephemeral" if qd_native_run_id else "not_persisted",
         "result": result,
     }
+    if trace:
+        response["trace"] = trace
     if validation_metrics:
         response["autoresearchValidationMetrics"] = validation_metrics
     if cost_stress:
@@ -168,6 +174,28 @@ def _autoresearch_ohlcv_provenance(data: dict[str, Any]) -> dict[str, Any]:
         "autoresearch_run_id": trace.get("run_id"),
         "autoresearch_candidate_id": trace.get("candidate_id"),
     }
+
+
+def _autoresearch_trace_identity(data: dict[str, Any]) -> dict[str, Any]:
+    trace = data.get("autoresearchTrace") if isinstance(data.get("autoresearchTrace"), dict) else {}
+    if not trace:
+        return {}
+    keys = (
+        "contract_version",
+        "request_source",
+        "run_id",
+        "candidate_id",
+        "source_surface",
+        "strategy_ir_sha256",
+        "qd_code_sha256",
+        "benchmark_set_hash",
+        "qd_native_validation_scope",
+    )
+    payload = {key: trace.get(key) for key in keys if trace.get(key) not in (None, "")}
+    scope = data.get("qd_native_validation_scope") or data.get("qdNativeValidationScope")
+    if scope and "qd_native_validation_scope" not in payload:
+        payload["qd_native_validation_scope"] = scope
+    return payload
 
 
 def _int_or_none(value: Any) -> Optional[int]:

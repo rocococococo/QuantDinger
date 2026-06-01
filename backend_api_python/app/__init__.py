@@ -366,17 +366,21 @@ def create_app(config_name='default'):
     except Exception as _ib_exc:
         logger.debug(f"ib_insync patchAsyncio skipped (ib_insync not installed?): {_ib_exc}")
     
-    # Initialize database and ensure admin user exists
-    try:
-        from app.utils.db import init_database, get_db_type
-        logger.info(f"Database type: {get_db_type()}")
-        init_database()
-        
-        # Ensure admin user exists (multi-user mode)
-        from app.services.user_service import get_user_service
-        get_user_service().ensure_admin_exists()
-    except Exception as e:
-        logger.warning(f"Database initialization note: {e}")
+    # Initialize database and ensure admin user exists.
+    # AutoResearch loopback workers only need stateless replay routes.
+    if os.getenv("DISABLE_DATABASE_BOOTSTRAP", "false").lower() == "true":
+        logger.info("Database bootstrap disabled via DISABLE_DATABASE_BOOTSTRAP")
+    else:
+        try:
+            from app.utils.db import init_database, get_db_type
+            logger.info(f"Database type: {get_db_type()}")
+            init_database()
+
+            # Ensure admin user exists (multi-user mode)
+            from app.services.user_service import get_user_service
+            get_user_service().ensure_admin_exists()
+        except Exception as e:
+            logger.warning(f"Database initialization note: {e}")
 
     from app.routes import register_routes
     register_routes(app)
@@ -401,4 +405,3 @@ def create_app(config_name='default'):
         restore_running_strategies()
     
     return app
-
