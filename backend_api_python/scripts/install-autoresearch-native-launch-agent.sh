@@ -89,7 +89,21 @@ PLIST
 chmod 644 "${PLIST_PATH}"
 
 launchctl bootout "gui/${UID_VALUE}/${LABEL}" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/${UID_VALUE}" "${PLIST_PATH}"
+for _attempt in 1 2 3 4 5; do
+  if ! launchctl print "gui/${UID_VALUE}/${LABEL}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.5
+done
+for _attempt in 1 2 3; do
+  if launchctl bootstrap "gui/${UID_VALUE}" "${PLIST_PATH}"; then
+    break
+  fi
+  if [[ "${_attempt}" == "3" ]]; then
+    exit 1
+  fi
+  sleep 1
+done
 launchctl enable "gui/${UID_VALUE}/${LABEL}"
 launchctl kickstart -k "gui/${UID_VALUE}/${LABEL}"
 
